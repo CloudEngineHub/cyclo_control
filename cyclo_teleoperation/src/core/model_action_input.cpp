@@ -60,7 +60,11 @@ ModelActionInput::ModelActionInput(
           rclcpp::Time stamp(0, 0, node_.get_clock()->get_clock_type());
           if (!validStamp(msg->header.stamp, joint_stamps_[id], stamp)) {return;}
           try {
-            if (!robot_.updateGripperReference(*msg, id)) {return;}
+            if (!robot_.updateGripperReference(*msg, id)) {
+              RCLCPP_WARN_THROTTLE(node_.get_logger(), *node_.get_clock(), 2000,
+                "Gripper command ignored for group %u: missing or invalid joint data", id);
+              return;
+            }
           } catch (const std::exception & error) {
             RCLCPP_WARN_THROTTLE(node_.get_logger(), *node_.get_clock(), 2000,
               "Invalid joint command ignored: %s", error.what());
@@ -71,8 +75,13 @@ ModelActionInput::ModelActionInput(
       }));
     pose_inputs_.push_back(node.create_subscription<geometry_msgs::msg::PoseStamped>(
       pose_topic, qos, [this, id](const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
-          if (!enabled_() || reference_type_() != "absolute_eef_pose" ||
-          msg->header.frame_id != frame_) {return;}
+          if (!enabled_() || reference_type_() != "absolute_eef_pose") {return;}
+          if (msg->header.frame_id != frame_) {
+            RCLCPP_WARN_THROTTLE(node_.get_logger(), *node_.get_clock(), 2000,
+              "Pose command ignored for group %u: frame '%s' must be '%s'",
+              id, msg->header.frame_id.c_str(), frame_.c_str());
+            return;
+          }
           rclcpp::Time stamp(0, 0, node_.get_clock()->get_clock_type());
           if (!validStamp(msg->header.stamp, pose_stamps_[id], stamp)) {return;}
           const auto & p = msg->pose.position;
@@ -82,6 +91,8 @@ ModelActionInput::ModelActionInput(
           if (!position.allFinite() || !rotation.coeffs().allFinite() ||
           !std::isfinite(rotation.norm()) || rotation.norm() < 1e-9)
           {
+            RCLCPP_WARN_THROTTLE(node_.get_logger(), *node_.get_clock(), 2000,
+              "Pose command ignored for group %u: non-finite position or invalid quaternion", id);
             return;
           }
           poses_[id].pose.translation() = position;
@@ -116,7 +127,12 @@ ModelActionInput::ModelActionInput(
           rclcpp::Time stamp(0, 0, node_.get_clock()->get_clock_type());
           if (!validStamp(msg->header.stamp, joint_stamps_[id], stamp)) {return;}
           try {
-            if (!robot_.updateLeaderReference(*msg, id)) {return;}
+            if (!robot_.updateLeaderReference(*msg, id)) {
+              RCLCPP_WARN_THROTTLE(node_.get_logger(), *node_.get_clock(), 2000,
+                "Invalid direct joint input for group %u; Cyclo cannot block follower delivery",
+              id);
+              return;
+            }
           } catch (const std::exception & error) {
             RCLCPP_WARN_THROTTLE(node_.get_logger(), *node_.get_clock(), 2000,
             "Invalid direct model command observation ignored: %s", error.what());
@@ -140,7 +156,13 @@ bool ModelActionInput::hasExternalActionPublishers() const
   auto has_external_publisher = [this](const std::string & topic) {
       for (const auto & info : node_.get_publishers_info_by_topic(topic)) {
         if (info.node_name() != node_.get_name() ||
-          info.node_namespace() != node_.get_namespace()) {return true;}
+          info.node_namespace() != node_.get_namespace())
+        {
+          RCLCPP_DEBUG(node_.get_logger(),
+            "External command publisher: namespace=%s node=%s topic=%s",
+            info.node_namespace().c_str(), info.node_name().c_str(), topic.c_str());
+          return true;
+        }
       }
       return false;
     };
@@ -157,12 +179,21 @@ bool ModelActionInput::validStamp(
   const builtin_interfaces::msg::Time & message, const rclcpp::Time & previous,
   rclcpp::Time & stamp) const
 {
-  if (message.sec < 0 || message.nanosec >= 1000000000u) {return false;}
+  if (message.sec < 0 || message.nanosec >= 1000000000u) {
+    RCLCPP_DEBUG_THROTTLE(node_.get_logger(), *node_.get_clock(), 2000,
+      "Command ignored by Cyclo: invalid timestamp");
+    return false;
+  }
   stamp = rclcpp::Time(message, node_.get_clock()->get_clock_type());
   // Zero means immediate, for compatibility with existing JointTrajectory publishers.
   if (stamp.nanoseconds() == 0) {return true;}
   const double age = (node_.now() - stamp).seconds();
-  return stamp >= reset_time_ && stamp >= previous && age >= 0.0 && age <= timeout_;
+  const bool valid = stamp >= reset_time_ && stamp >= previous && age >= 0.0 && age <= timeout_;
+  if (!valid) {
+    RCLCPP_DEBUG_THROTTLE(node_.get_logger(), *node_.get_clock(), 2000,
+      "Command ignored by Cyclo: stale, future, or out-of-order timestamp (age=%.3f s)", age);
+  }
+  return valid;
 }
 
 void ModelActionInput::clear()

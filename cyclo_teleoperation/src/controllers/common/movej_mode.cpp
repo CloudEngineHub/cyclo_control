@@ -26,6 +26,7 @@ bool MoveJMode::configure(
   const ModeConfiguration & configuration)
 {
   configuration_ = configuration;
+  logger_ = node.get_logger();
   trajectories_.clear();
   for (const auto & group : configuration_.control_groups) {
     trajectories_.emplace(group.id, ArmTrajectory{});
@@ -83,9 +84,17 @@ void MoveJMode::updateArm(
     start[i] = context.follower_position[index];
     reference[i] = context.leader_reference[index];
   }
+  const bool was_waiting = trajectory.slow_start.waitingForCommand();
+  const bool was_active = trajectory.slow_start.active();
   const FixedDurationSlowStartSample slow_start_sample = trajectory.slow_start.update(
     start, reference, state.leader_sequence, state.leader_duration,
     context.now_seconds);
+  if (was_waiting && slow_start_sample.active) {
+    RCLCPP_INFO(logger_, "%s slow start started: %.3f s",
+      group.name.c_str(), trajectory.slow_start.duration());
+  } else if (was_active && slow_start_sample.complete) {
+    RCLCPP_INFO(logger_, "%s slow-start interpolation completed", group.name.c_str());
+  }
   JointTrajectorySample sample;
   sample.position = slow_start_sample.position;
   sample.velocity = slow_start_sample.velocity;

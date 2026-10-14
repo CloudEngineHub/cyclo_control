@@ -122,7 +122,14 @@ public:
     }
     robot_teleoperation_->setModeRequestCallback(
       [this](uint16_t mode, uint64_t & id, std::string & message) {
-        return requestMode(mode, id, message);
+        const bool accepted = requestMode(mode, id, message);
+        if (accepted) {
+          RCLCPP_INFO(get_logger(), "Mode %u change accepted; waiting for activation", mode);
+        } else {
+          message = "Mode change rejected: " + message;
+          RCLCPP_WARN(get_logger(), "%s (requested mode=%u)", message.c_str(), mode);
+        }
+        return accepted;
       });
     parameter_callback_handle_ = add_on_set_parameters_callback(
       [this](const std::vector<rclcpp::Parameter> & parameters) {
@@ -150,6 +157,8 @@ public:
     timer_ = create_wall_timer(
       std::chrono::duration<double>(1.0 / frequency),
       std::bind(&TeleoperationNode::controlLoop, this));
+    RCLCPP_INFO(get_logger(), "Waiting for complete follower feedback on '%s'",
+      follower_subscription_->get_topic_name());
     publishStatus(
       ControlStatus::kHolding,
       "Waiting for complete follower feedback");
@@ -158,14 +167,14 @@ public:
   }
 
 private:
-  void validateSourceSwitch() const
+  void validateSourceSwitch()
   {
     if (source_manager_->modelPending()) {
       throw std::runtime_error("Wait for the model publisher handoff to finish");
     }
-    if (modelStopRequired() && !source_manager_->modelAvailable()) {
-      throw std::runtime_error(
-              "Model publisher must provide /model_action/set_enabled before switching source");
+    const bool stop_required = modelStopRequired();
+    if (stop_required && !source_manager_->modelAvailable()) {
+      throw std::runtime_error(unavailableModelStopMessage());
     }
     if (source() == ControlSource::kTeleoperation && modes_.ready() &&
       pose_sequences_->hasExitPose(modes_.active()) && !feedbackFresh())
@@ -179,11 +188,15 @@ private:
     {
       throw std::runtime_error("Wait for the current mode/pose transition to finish");
     }
+    // Validation and handoff share the publisher snapshot of this request.
+    source_stop_required_ = stop_required;
   }
 
-  void failSourceSwitch(const std::string & reason)
+  void failSourceSwitch(const std::string & reason, const char * operation = nullptr)
   {
-    RCLCPP_ERROR(get_logger(), "Source transition failed: %s", reason.c_str());
+    RCLCPP_ERROR(get_logger(), "%s failed: %s; source set to none",
+      operation ? operation :
+      source_manager_->transitioning() ? "Source change" : "Model control update", reason.c_str());
     setLeaderActionEnabled(false);
     modes_.deactivate();
     modes_.cancelTransition(*pose_sequences_);
@@ -192,7 +205,7 @@ private:
 
   void beginSourceSwitch(const ControlSource target)
   {
-    source_manager_->stopModel(modelStopRequired(),
+    source_manager_->stopModel(source_stop_required_,
       [this, target](bool success, const std::string & message) {
         if (!success) {failSourceSwitch(message); return;}
         publishHandoffHold();
@@ -215,8 +228,13 @@ private:
 
   bool modelStopRequired() const
   {
-    return source_manager_->stopRequired(
-      model_action_input_ && model_action_input_->hasExternalActionPublishers());
+    return model_action_input_ && model_action_input_->hasExternalActionPublishers();
+  }
+
+  std::string unavailableModelStopMessage() const
+  {
+    return "External command publisher detected, but stop service '" +
+           source_manager_->modelServiceName() + "' is unavailable; no stop request was sent";
   }
 
   bool isDirectModelJoint() const {return source_manager_->direct();}
@@ -271,20 +289,21 @@ private:
     modes_.setPending(teleop);
     source_manager_->activateSource(source,
       !teleop && modes_.modelModes().at(modes_.modelRequested()).directJoint());
-    publishStatus(ControlStatus::kHolding, "Source selected; all groups remain stopped");
+    publishStatus(ControlStatus::kHolding, "Preparing source; all teleoperation requests cleared");
   }
 
   bool requestMode(const uint16_t mode, uint64_t & id, std::string & message)
   {
     id = 0;
     if (source_manager_->transitioning() || source_manager_->modelPending()) {
-      message = "A source transition is in progress";
+      message = "A source change or model start/stop request is in progress";
       return false;
     }
     const auto & registry = source() ==
       ControlSource::kModelAction ? modes_.modelModes() : modes_.teleopModes();
     if (source() == ControlSource::kNone || !registry.contains(mode)) {
-      message = "Unknown mode for the selected source";
+      message = source() == ControlSource::kNone ? "No control source is active" :
+        "Mode " + std::to_string(mode) + " is not configured for the current source";
       return false;
     }
     if (active_groups_ != 0 || requested_groups_ != 0 || modes_.started() ||
@@ -292,17 +311,19 @@ private:
       pose_sequences_->movingPresetGroups() != 0 ||
       pose_sequences_->movingFinalInitialPoseGroups() != 0)
     {
-      message = "All groups must be stopped and no pose movement may be in progress";
+      message = (active_groups_ != 0 || requested_groups_ != 0) ?
+        "Stop all active control groups first" : "A mode or pose movement is in progress";
       return false;
     }
     if (source() == ControlSource::kModelAction) {
-      if (modelStopRequired() && !source_manager_->modelAvailable()) {
-        message = "Model publisher must acknowledge stop before changing model_action mode";
+      const bool stop_required = modelStopRequired();
+      if (stop_required && !source_manager_->modelAvailable()) {
+        message = unavailableModelStopMessage();
         return false;
       }
-      source_manager_->stopModel(modelStopRequired(),
+      source_manager_->stopModel(stop_required,
         [this, mode](bool success, const std::string & reason) {
-          if (!success) {failSourceSwitch(reason); return;}
+          if (!success) {failSourceSwitch(reason, "Mode change"); return;}
           publishHandoffHold();
           try {
             modes_.selectModel(mode);
@@ -315,7 +336,7 @@ private:
             syncCommandToFeedback();
             feedback_.hold() = robot_teleoperation_->followerPosition();
           } catch (const std::exception & error) {
-            failSourceSwitch(error.what());
+            failSourceSwitch(error.what(), "Mode change");
           }
         });
     } else {
@@ -340,20 +361,24 @@ private:
         publishStatus(ControlStatus::kHolding, entry.directJoint() ?
           "Direct model joint mode selected; Cyclo joint output and QP are disabled" :
           "Model pose controller activated");
+        RCLCPP_INFO(get_logger(), "Model mode %u prepared: %s",
+          modes_.modelRequested(), entry.reference_type.c_str());
         source_manager_->startModel(entry.directJoint(),
           [this](bool success, const std::string & message) {
             if (!success) {failSourceSwitch(message); return;}
+            RCLCPP_INFO(get_logger(), "Model mode %u ready", modes_.modelRequested());
             if (source_manager_->transitioning()) {source_manager_->complete(source());}
           });
       }
       if (!source_manager_->modelGranted()) {return;}
       if (isDirectModelJoint()) {
         const auto observed = model_action_input_->freshGroups();
-        source_manager_->observeDirect(observed != 0);
         if (active_groups_ != observed) {
           active_groups_ = observed;
           publishStatus(ControlStatus::kHolding,
-            "Direct model joint commands observed; no Cyclo joint commands are published");
+            observed != 0 ?
+            "Direct model joint input observed; Cyclo joint output is disabled" :
+            "Direct model joint input expired; Cyclo cannot stop external joint commands");
         }
         return;
       }
@@ -390,8 +415,12 @@ private:
         get_parameter("hold.max_correction_velocity").as_double(),
         get_parameter("hold.tracking_weight").as_double());
       if (!runtime_->step(output, context.dt, feedback_.position(), feedback_.velocity())) {
+        model_qp_failed_for_log_ = true;
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
           "Model action QP failed; holding the last command and retrying");
+      } else if (model_qp_failed_for_log_) {
+        model_qp_failed_for_log_ = false;
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000, "Model action QP recovered");
       }
       publishCommand(feedback_.position(), &output);
     } catch (const std::exception & error) {
@@ -655,9 +684,16 @@ private:
     if (!robot_teleoperation_->updateFollowerState(*message)) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "Follower state does not contain every joint required by robot profile '%s'",
-        robot_teleoperation_->robotName().c_str());
+        "Follower feedback ignored on '%s': incomplete or invalid joint state for '%s'",
+        follower_subscription_->get_topic_name(), robot_teleoperation_->robotName().c_str());
       return;
+    }
+    if (!feedback_seen_for_log_) {
+      RCLCPP_INFO(get_logger(), "Complete follower feedback received");
+      feedback_seen_for_log_ = true;
+    } else if (!feedbackFresh()) {
+      RCLCPP_INFO(get_logger(),
+          "Follower feedback recovered; resetting references to current state");
     }
     const auto received = feedback_.accept(now(), get_parameter("joint_state_timeout").as_double());
     if (received.interrupted) {active_groups_ = 0;}
@@ -715,8 +751,8 @@ private:
     publishStatus(
       ControlStatus::kHolding,
       enabled ?
-      "Leader action output enabled; all control groups remain stopped" :
-      "Leader action output disabled; model control may take ownership");
+      "Leader action output enabled; all teleoperation requests cleared" :
+      "Leader action output disabled; awaiting source handoff");
   }
 
   void commandCallback(const ControlRequest & request)
@@ -751,7 +787,7 @@ private:
       transition_id_ = request.transition_id;
       publishStatus(
         ControlStatus::kHolding,
-        "Leader control request ignored while model control owns the follower command");
+        "Leader control request ignored: leader action output is disabled");
       return;
     }
     if (
@@ -809,7 +845,10 @@ private:
         transition_id_ = request.transition_id;
         publishStatus(
           ControlStatus::kError,
-          "Initial pose trigger ignored because it is disabled for the active control mode");
+          (!modes_.ready() || modes_.pending() || modes_.started() ||
+          request.control_mode != modes_.active()) ?
+          "Initial pose request rejected: requested control mode is not ready" :
+          "Initial pose request rejected: no pose configured for the selected control group");
         return;
       }
       if (
@@ -1072,6 +1111,7 @@ private:
         ControlStatus::kActive,
         active_groups_ == requested_groups_ ?
         "Mode activated" : "Mode activated; waiting for fresh leader reference");
+      RCLCPP_INFO(get_logger(), "Teleop mode %u activated", modes_.active());
       return true;
     } catch (const std::exception & error) {
       modes_.deactivate();
@@ -1152,11 +1192,16 @@ private:
       if (!runtime_->step(output, context.dt, feedback_.position(), feedback_.velocity())) {
         feedback_.velocity().setZero();
         publishCommand(feedback_.position(), &output);
+        pose_qp_failed_for_log_ = true;
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 1000,
           "%s pose QP failed; holding the last command and retrying",
           exit_pose ? "Exit" : "Initial");
         return true;
+      }
+      if (pose_qp_failed_for_log_) {
+        pose_qp_failed_for_log_ = false;
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000, "Pose QP recovered");
       }
       publishCommand(feedback_.position(), &output);
       const bool moving = exit_pose ?
@@ -1394,10 +1439,16 @@ private:
       if (!runtime_->step(output, context.dt, feedback_.position(), feedback_.velocity())) {
         feedback_.velocity().setZero();
         publishCommand(feedback_.position(), &output);
+        teleop_qp_failed_for_log_ = true;
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 1000,
           "Teleoperation QP failed; holding the last command and retrying");
         return;
+      }
+
+      if (teleop_qp_failed_for_log_) {
+        teleop_qp_failed_for_log_ = false;
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000, "Teleoperation QP recovered");
       }
 
       publishCommand(feedback_.position(), &output);
@@ -1440,6 +1491,16 @@ private:
 
   void publishStatus(const uint8_t state, const std::string & message)
   {
+    // Deduplicate identical errors without hiding a different error shortly afterwards.
+    if (state != last_status_state_for_log_ || message != last_status_message_for_log_) {
+      if (state == ControlStatus::kError) {
+        RCLCPP_ERROR(get_logger(), "%s", message.c_str());
+      } else {
+        RCLCPP_DEBUG(get_logger(), "%s", message.c_str());
+      }
+      last_status_state_for_log_ = state;
+      last_status_message_for_log_ = message;
+    }
     if (!robot_teleoperation_ || source() == ControlSource::kNone) {
       return;
     }
@@ -1483,6 +1544,12 @@ private:
   ControlGroupMask requested_groups_ = 0, active_groups_ = 0;
   uint64_t transition_id_ = 0, next_transition_id_ = 0;
   bool groups_pending_ = false, leader_action_enabled_ = false;
+  bool source_stop_required_ = false;
+  bool feedback_seen_for_log_ = false;
+  uint8_t last_status_state_for_log_ = 0;
+  std::string last_status_message_for_log_;
+  bool model_qp_failed_for_log_ = false, pose_qp_failed_for_log_ = false;
+  bool teleop_qp_failed_for_log_ = false;
   ControlGroupMask preset_update_pending_groups_ = 0, preset_cancel_pending_groups_ = 0;
   ControlGroupMask final_initial_pose_update_pending_groups_ = 0;
   ControlGroupMask final_initial_pose_cancel_pending_groups_ = 0;

@@ -27,11 +27,13 @@ public:
   void poll();
   bool pending() const {return static_cast<bool>(completion_);}
   bool available() const {return client_->service_is_ready();}
+  std::string serviceName() const {return client_->get_service_name();}
 
 private:
   void finish(bool success, const std::string & message);
   rclcpp::Client<std_srvs::srv::SetBool>::SharedPtr client_;
   Completion completion_;
+  bool requested_enabled_ = false;  // Diagnostic context only.
   int64_t request_id_ = 0;
   uint64_t generation_ = 0;
   std::chrono::steady_clock::time_point deadline_;

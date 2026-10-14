@@ -95,6 +95,7 @@ private:
 
   struct Sequence
   {
+    std::string label;
     std::vector<Step> steps;
     double duration = 3.0;
     double completion_tolerance = 0.03;
@@ -148,6 +149,7 @@ private:
   uint8_t runnerState(ControlGroupId id, Purpose purpose) const;
 
   ModeConfiguration configuration_;
+  rclcpp::Logger logger_{rclcpp::get_logger("pose_sequence")};
   std::unordered_map<uint16_t, GroupSequence> initial_poses_;
   std::unordered_map<uint16_t, bool> automatic_initial_pose_enabled_;
   std::unordered_map<uint16_t, GroupSequence> exit_poses_;

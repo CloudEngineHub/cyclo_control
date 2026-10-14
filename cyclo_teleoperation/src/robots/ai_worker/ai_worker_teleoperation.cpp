@@ -253,20 +253,25 @@ bool AIWorkerTeleoperation::initialize()
 
 bool AIWorkerTeleoperation::updateFollowerState(const sensor_msgs::msg::JointState & message)
 {
+  const auto reject = [this](const std::string & reason) {
+      RCLCPP_DEBUG_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+        "Follower feedback rejected: %s", reason.c_str());
+      return false;
+    };
   if (message.header.stamp.sec < 0 || message.header.stamp.nanosec >= 1000000000u) {
-    return false;
+    return reject("invalid timestamp");
   }
   if (
     message.position.size() != message.name.size() ||
     (!message.velocity.empty() && message.velocity.size() != message.name.size()))
   {
-    return false;
+    return reject("joint name/position/velocity array sizes differ");
   }
 
   std::unordered_map<std::string, size_t> message_index;
   for (size_t i = 0; i < message.name.size(); ++i) {
     if (!message_index.emplace(message.name[i], i).second) {
-      return false;
+      return reject("duplicate joint '" + message.name[i] + "'");
     }
   }
 
@@ -276,16 +281,16 @@ bool AIWorkerTeleoperation::updateFollowerState(const sensor_msgs::msg::JointSta
   for (size_t i = 0; i < follower_joint_names_.size(); ++i) {
     const auto iter = message_index.find(follower_joint_names_[i]);
     if (iter == message_index.end()) {
-      return false;
+      return reject("missing joint '" + follower_joint_names_[i] + "'");
     }
     const size_t source = iter->second;
     if (!std::isfinite(message.position[source])) {
-      return false;
+      return reject("non-finite position for '" + follower_joint_names_[i] + "'");
     }
     follower_position[i] = message.position[source];
     if (!message.velocity.empty()) {
       if (!std::isfinite(message.velocity[source])) {
-        return false;
+        return reject("non-finite velocity for '" + follower_joint_names_[i] + "'");
       }
       follower_velocity[i] = message.velocity[source];
     } else {
@@ -299,7 +304,7 @@ bool AIWorkerTeleoperation::updateFollowerState(const sensor_msgs::msg::JointSta
     !std::isfinite(message.position[left_gripper->second]) ||
     !std::isfinite(message.position[right_gripper->second]))
   {
-    return false;
+    return reject("missing or non-finite gripper joint position");
   }
   follower_auxiliary_position[kLeftGroupId][0] = message.position[left_gripper->second];
   follower_auxiliary_position[kRightGroupId][0] = message.position[right_gripper->second];

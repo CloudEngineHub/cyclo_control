@@ -20,7 +20,7 @@
 namespace cyclo_teleoperation
 {
 CommandSourceManager::CommandSourceManager(rclcpp::Node & node, Switch change, Switch validate)
-: change_(std::move(change)), validate_(std::move(validate)),
+: logger_(node.get_logger()), change_(std::move(change)), validate_(std::move(validate)),
   ownership_(std::make_unique<RuntimeOwnership>(node, "/source")), model_session_(node)
 {
   publisher_ = node.create_publisher<std_msgs::msg::String>(
@@ -39,7 +39,8 @@ CommandSourceManager::CommandSourceManager(rclcpp::Node & node, Switch change, S
         response->success = true;
         response->message = "Source request accepted; /source reports transition completion";
       } catch (const std::exception & error) {
-        response->message = error.what();
+        response->message = std::string("Source change rejected: ") + error.what();
+        RCLCPP_WARN(logger_, "%s", response->message.c_str());
       }
     });
   toggle_service_ = node.create_service<std_srvs::srv::Trigger>(
@@ -49,8 +50,10 @@ CommandSourceManager::CommandSourceManager(rclcpp::Node & node, Switch change, S
         select(source_ == ControlSource::kTeleoperation ?
           ControlSource::kModelAction : ControlSource::kTeleoperation);
         response->success = true;
+        response->message = "Source request accepted; /source reports transition completion";
       } catch (const std::exception & error) {
-        response->message = error.what();
+        response->message = std::string("Source change rejected: ") + error.what();
+        RCLCPP_WARN(logger_, "%s", response->message.c_str());
       }
     });
 }
@@ -86,18 +89,20 @@ void CommandSourceManager::fail()
   complete(ControlSource::kNone);
 }
 
-bool CommandSourceManager::stopRequired(bool external_publishers) const
-{
-  return model_acknowledged_ || direct_seen_ || external_publishers;
-}
-
 void CommandSourceManager::stopModel(
   bool required, ModelActionSession::Completion completion)
 {
   suspendModelOutput();
+  // Only current external publishers require a stop acknowledgement.
+  // An available service alone must not turn an optional stop into a handoff.
+  if (!required) {
+    model_acknowledged_ = false;
+    completion(true, "");
+    return;
+  }
   model_session_.request(false, required,
     [this, completion](bool success, const std::string & message) {
-      if (success) {model_acknowledged_ = false; direct_seen_ = false;}
+      if (success) {model_acknowledged_ = false;}
       completion(success, message);
     });
 }
@@ -138,9 +143,13 @@ void CommandSourceManager::select(const ControlSource source)
     throw std::runtime_error("A source transition is already in progress");
   }
   if (source == source_) {
+    RCLCPP_INFO(logger_, "Source unchanged: %s",
+      source == ControlSource::kTeleoperation ? "teleop" : "model_action");
     return;
   }
   validate_(source);
+  RCLCPP_INFO(logger_, "Source change accepted: %s; waiting for handoff completion",
+    source == ControlSource::kTeleoperation ? "teleop" : "model_action");
   source_ = ControlSource::kNone;
   pending_ = source;
   publish("switching");
@@ -157,6 +166,9 @@ void CommandSourceManager::complete(const ControlSource source)
   source_ = source;
   pending_ = ControlSource::kNone;
   publish(source == ControlSource::kTeleoperation ? "teleop" :
+    source == ControlSource::kModelAction ? "model_action" : "none");
+  RCLCPP_INFO(logger_, "Source: %s",
+    source == ControlSource::kTeleoperation ? "teleop" :
     source == ControlSource::kModelAction ? "model_action" : "none");
 }
 }  // namespace cyclo_teleoperation

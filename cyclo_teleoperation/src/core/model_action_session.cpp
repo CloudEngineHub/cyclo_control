@@ -21,13 +21,14 @@ ModelActionSession::ModelActionSession(rclcpp::Node & node)
 
 void ModelActionSession::request(bool enabled, bool required, Completion completion)
 {
-  if (pending()) {throw std::runtime_error("A model publisher handoff is already pending");}
+  if (pending()) {throw std::runtime_error("A model start/stop request is already pending");}
   if (!available()) {
     completion(!required, required ?
-      "Model publisher must provide /model_action/set_enabled before handing off control" : "");
+      "Stop service '" + serviceName() + "' is unavailable; no request was sent" : "");
     return;
   }
   completion_ = std::move(completion);
+  requested_enabled_ = enabled;
   deadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   const auto generation = ++generation_;
   auto request = std::make_shared<std_srvs::srv::SetBool::Request>();
@@ -36,7 +37,10 @@ void ModelActionSession::request(bool enabled, bool required, Completion complet
       [this, generation](rclcpp::Client<std_srvs::srv::SetBool>::SharedFuture future) {
         if (generation != generation_ || !completion_) {return;}
         const auto response = future.get();
-        finish(response->success, response->message);
+        const std::string operation = requested_enabled_ ? "start" : "stop";
+        finish(response->success, response->success ? response->message :
+          "Model " + operation + " request to '" + serviceName() + "' was rejected" +
+        (response->message.empty() ? "" : ": " + response->message));
     });
   request_id_ = pending.request_id;
 }
@@ -51,8 +55,9 @@ void ModelActionSession::poll()
     stop->data = false;
     const auto pending_stop = client_->async_send_request(stop);
     client_->remove_pending_request(pending_stop.request_id);
-    finish(false,
-        "Model publisher handoff timed out; external publication cannot be guaranteed stopped");
+    finish(false, std::string("No response to model ") +
+      (requested_enabled_ ? "start" : "stop") + " request to '" + serviceName() +
+      "' within 2 seconds; external publication may still be active");
   }
 }
 

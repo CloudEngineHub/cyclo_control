@@ -29,6 +29,7 @@ PoseSequenceManager::GroupSequence PoseSequenceManager::loadSequence(
   GroupSequence result;
   for (const auto & group : configuration_.control_groups) {
     Sequence sequence;
+    sequence.label = prefix;
     for (const auto & step_name : step_names) {
       const std::string parameter =
         prefix + ".steps." + step_name + "." + group.name + ".positions";
@@ -84,6 +85,7 @@ bool PoseSequenceManager::configure(
   const std::vector<int64_t> & available_presets)
 {
   configuration_ = configuration;
+  logger_ = node.get_logger();
   if (configuration_.control_groups.empty() || configuration_.control_groups.size() > 64) {
     return false;
   }
@@ -222,6 +224,10 @@ void PoseSequenceManager::rebaseActiveSequences(const ModeContext & context)
     }
     runner.moving = was_moving || target_changed;
     runner.state = runner.moving ? 2 : 3;
+    if (runner.moving) {
+      RCLCPP_INFO(logger_, "%s pose restarted from feedback: %s, step=%s",
+        group_config.name.c_str(), runner.sequence->label.c_str(), step.name.c_str());
+    }
   }
 }
 
@@ -289,6 +295,9 @@ bool PoseSequenceManager::startRunner(
   runner.active = true;
   runner.moving = true;
   runner.state = 2;
+  RCLCPP_INFO(logger_, "%s pose started: %s, step=%s (%.3f s)",
+    group_config.name.c_str(), sequence.label.c_str(),
+    sequence.steps.at(runner.step_index).name.c_str(), sequence.duration);
   return true;
 }
 
@@ -412,6 +421,8 @@ bool PoseSequenceManager::updateRunner(
     elapsed >= runner.sequence->duration &&
     maximum_error <= runner.sequence->completion_tolerance)
   {
+    RCLCPP_INFO(logger_, "%s pose step reached: %s, step=%s",
+      group_config.name.c_str(), runner.sequence->label.c_str(), step.name.c_str());
     if (runner.step_index + 1 < runner.sequence->steps.size()) {
       ++runner.step_index;
       for (size_t i = 0; i < group_config.follower_joint_indices.size(); ++i) {
@@ -431,6 +442,8 @@ bool PoseSequenceManager::updateRunner(
     } else {
       runner.moving = false;
       runner.state = 3;
+      RCLCPP_INFO(logger_, "%s pose completed: %s",
+        group_config.name.c_str(), runner.sequence->label.c_str());
     }
     return true;
   }
@@ -439,9 +452,9 @@ bool PoseSequenceManager::updateRunner(
     runner.moving = false;
     runner.state = 4;
     error_message_ =
-      "Pose sequence step '" + step.name + "' for control group '" +
-      group_config.name + "' timed out with maximum joint error " +
-      std::to_string(maximum_error);
+      group_config.name + " pose timed out: " + runner.sequence->label +
+      ", step=" + step.name + " after " + std::to_string(runner.sequence->timeout) +
+      " s; maximum position error=" + std::to_string(maximum_error);
     return false;
   }
   return true;
@@ -506,7 +519,7 @@ bool PoseSequenceManager::startFinalInitialPose(
   error_message_.clear();
   const auto sequence = initial_poses_.find(mode);
   if (sequence == initial_poses_.end()) {
-    error_message_ = "Initial pose is disabled for control mode " + std::to_string(mode);
+    error_message_ = "No initial pose configured for control mode " + std::to_string(mode);
     return false;
   }
   if (groups == 0) {

@@ -48,9 +48,8 @@ public:
   bool modelPending() const {return model_session_.pending();}
   bool modelGranted() const {return model_granted_;}
   bool modelAvailable() const {return model_session_.available();}
+  std::string modelServiceName() const {return model_session_.serviceName();}
   bool managedModel() const {return model_acknowledged_;}
-  bool stopRequired(bool external_publishers) const;
-  void observeDirect(bool observed) {direct_seen_ = direct_seen_ || observed;}
   void stopModel(bool required, ModelActionSession::Completion completion);
   void startModel(bool direct, ModelActionSession::Completion completion);
   void suspendModelOutput();
@@ -63,6 +62,7 @@ public:
 
 private:
   void publish(const std::string & value);
+  rclcpp::Logger logger_;
   Switch change_;
   Switch validate_;
   std::unique_ptr<RuntimeOwnership> ownership_;
@@ -70,7 +70,7 @@ private:
   ControlSource active_source_ = ControlSource::kNone;
   ControlSource exit_target_ = ControlSource::kNone;
   bool direct_ = true, model_granted_ = false, model_acknowledged_ = false;
-  bool direct_seen_ = false, joint_output_allowed_ = false, exit_pending_ = false;
+  bool joint_output_allowed_ = false, exit_pending_ = false;
   ControlSource source_ = ControlSource::kNone;
   ControlSource pending_ = ControlSource::kNone;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr publisher_;

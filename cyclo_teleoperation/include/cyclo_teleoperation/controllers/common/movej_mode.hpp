@@ -51,6 +51,7 @@ private:
     ModeOutput & output);
 
   ModeConfiguration configuration_;
+  rclcpp::Logger logger_{rclcpp::get_logger("movej_mode")};
   std::unordered_map<ControlGroupId, ArmTrajectory> trajectories_;
   ControllerConstraints constraints_;
   double kp_joint_ = 50.0;
