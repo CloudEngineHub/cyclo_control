@@ -45,6 +45,25 @@
 
 namespace cyclo_teleoperation
 {
+namespace
+{
+// Preserve status/service text on the wire; only human-readable log labels change.
+std::string controlLogMessage(std::string message)
+{
+  for (const auto & label : {
+        std::make_pair("Direct model joint", "Direct external joint"),
+        std::make_pair("Model pose", "External pose"),
+        std::make_pair("Model action", "External control")})
+  {
+    const auto offset = message.find(label.first);
+    if (offset != std::string::npos) {
+      message.replace(offset, std::char_traits<char>::length(label.first), label.second);
+    }
+  }
+  return message;
+}
+}  // namespace
+
 class TeleoperationNode : public rclcpp::Node
 {
 public:
@@ -184,9 +203,10 @@ private:
 
   void failSourceSwitch(const std::string & reason, const char * operation = nullptr)
   {
-    RCLCPP_ERROR(get_logger(), "%s failed: %s; source set to none",
+    RCLCPP_ERROR(get_logger(), "%s failed: %s; control source set to none",
       operation ? operation :
-      source_manager_->transitioning() ? "Source change" : "Model control update", reason.c_str());
+      source_manager_->transitioning() ? "Control source change" : "External control update",
+      controlLogMessage(reason).c_str());
     setLeaderActionEnabled(false);
     modes_.deactivate();
     modes_.cancelTransition(*pose_sequences_);
@@ -331,10 +351,10 @@ private:
         publishStatus(ControlStatus::kHolding, entry.directJoint() ?
           "Direct model joint mode selected; Cyclo joint output and QP are disabled" :
           "Model pose controller activated");
-        RCLCPP_INFO(get_logger(), "Model mode %u prepared: %s",
-          modes_.modelRequested(), entry.reference_type.c_str());
         source_manager_->startModel(entry.directJoint());
-        RCLCPP_INFO(get_logger(), "Model mode %u ready", modes_.modelRequested());
+        RCLCPP_INFO(get_logger(), "External mode %u ready: %s (%s)",
+          modes_.modelRequested(), entry.reference_type.c_str(),
+            entry.directJoint() ? "direct" : "QP");
         if (source_manager_->transitioning()) {source_manager_->complete(source());}
       }
       if (!source_manager_->modelGranted()) {return;}
@@ -384,14 +404,15 @@ private:
       if (!runtime_->step(output, context.dt, feedback_.position(), feedback_.velocity())) {
         model_qp_failed_for_log_ = true;
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
-          "Model action QP failed; holding the last command and retrying");
+          "External control QP failed; holding the last command and retrying");
       } else if (model_qp_failed_for_log_) {
         model_qp_failed_for_log_ = false;
-        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000, "Model action QP recovered");
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000, "External control QP recovered");
       }
       publishCommand(feedback_.position(), &output);
     } catch (const std::exception & error) {
-      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000, "%s", error.what());
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000, "%s",
+        controlLogMessage(error.what()).c_str());
       modes_.deactivate();
       model_action_input_->clear();
       active_groups_ = 0;
@@ -1078,7 +1099,7 @@ private:
         ControlStatus::kActive,
         active_groups_ == requested_groups_ ?
         "Mode activated" : "Mode activated; waiting for fresh leader reference");
-      RCLCPP_INFO(get_logger(), "Teleop mode %u activated", modes_.active());
+      RCLCPP_INFO(get_logger(), "Teleop mode %u ready", modes_.active());
       return true;
     } catch (const std::exception & error) {
       modes_.deactivate();
@@ -1449,9 +1470,9 @@ private:
     // Deduplicate identical errors without hiding a different error shortly afterwards.
     if (state != last_status_state_for_log_ || message != last_status_message_for_log_) {
       if (state == ControlStatus::kError) {
-        RCLCPP_ERROR(get_logger(), "%s", message.c_str());
+        RCLCPP_ERROR(get_logger(), "%s", controlLogMessage(message).c_str());
       } else {
-        RCLCPP_DEBUG(get_logger(), "%s", message.c_str());
+        RCLCPP_DEBUG(get_logger(), "%s", controlLogMessage(message).c_str());
       }
       last_status_state_for_log_ = state;
       last_status_message_for_log_ = message;

@@ -134,7 +134,7 @@ ModelActionInput::ModelActionInput(
             }
           } catch (const std::exception & error) {
             RCLCPP_WARN_THROTTLE(node_.get_logger(), *node_.get_clock(), 2000,
-            "Invalid direct model command observation ignored: %s", error.what());
+            "Invalid direct external command observation ignored: %s", error.what());
             return;
           }
           joint_received_[id] = true;
