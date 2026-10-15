@@ -38,7 +38,6 @@
 #include "cyclo_teleoperation/core/soft_hold.hpp"
 #include "cyclo_teleoperation/core/pose_sequence_manager.hpp"
 #include "cyclo_teleoperation/core/model_action_input.hpp"
-#include "cyclo_teleoperation/core/model_action_session.hpp"
 #include "cyclo_teleoperation/core/control_runtime.hpp"
 #include "cyclo_teleoperation/core/mode_manager.hpp"
 #include "cyclo_teleoperation/core/feedback_state.hpp"
@@ -169,13 +168,6 @@ public:
 private:
   void validateSourceSwitch()
   {
-    if (source_manager_->modelPending()) {
-      throw std::runtime_error("Wait for the model publisher handoff to finish");
-    }
-    const bool stop_required = modelStopRequired();
-    if (stop_required && !source_manager_->modelAvailable()) {
-      throw std::runtime_error(unavailableModelStopMessage());
-    }
     if (source() == ControlSource::kTeleoperation && modes_.ready() &&
       pose_sequences_->hasExitPose(modes_.active()) && !feedbackFresh())
     {
@@ -188,8 +180,6 @@ private:
     {
       throw std::runtime_error("Wait for the current mode/pose transition to finish");
     }
-    // Validation and handoff share the publisher snapshot of this request.
-    source_stop_required_ = stop_required;
   }
 
   void failSourceSwitch(const std::string & reason, const char * operation = nullptr)
@@ -205,36 +195,22 @@ private:
 
   void beginSourceSwitch(const ControlSource target)
   {
-    source_manager_->stopModel(source_stop_required_,
-      [this, target](bool success, const std::string & message) {
-        if (!success) {failSourceSwitch(message); return;}
-        publishHandoffHold();
-        source_manager_->allowJointOutput(source() == ControlSource::kTeleoperation);
-        beginSourceSwitchAfterStop(target);
-      });
+    source_manager_->suspendModelOutput();
+    publishHandoffHold();
+    source_manager_->allowJointOutput(source() == ControlSource::kTeleoperation);
+    beginSourceSwitchAfterStop(target);
   }
 
   ControlSource source() const {return source_manager_->activeSource();}
 
   void publishHandoffHold()
   {
-    // The only direct-mode publication: after stop acknowledgement, when command
-    // ownership is actually being transferred. Never called at startup/recovery.
+    // Replace a pending direct trajectory with measured feedback at handoff.
+    // Never called at startup/recovery; external publishers are not stopped by this hold.
     if (isDirectModelJoint() && feedbackFresh()) {
       robot_teleoperation_->publish(robot_teleoperation_->followerPosition(),
         robot_teleoperation_->followerAuxiliaryPosition());
     }
-  }
-
-  bool modelStopRequired() const
-  {
-    return model_action_input_ && model_action_input_->hasExternalActionPublishers();
-  }
-
-  std::string unavailableModelStopMessage() const
-  {
-    return "External command publisher detected, but stop service '" +
-           source_manager_->modelServiceName() + "' is unavailable; no stop request was sent";
   }
 
   bool isDirectModelJoint() const {return source_manager_->direct();}
@@ -295,8 +271,8 @@ private:
   bool requestMode(const uint16_t mode, uint64_t & id, std::string & message)
   {
     id = 0;
-    if (source_manager_->transitioning() || source_manager_->modelPending()) {
-      message = "A source change or model start/stop request is in progress";
+    if (source_manager_->transitioning()) {
+      message = "A source change is in progress";
       return false;
     }
     const auto & registry = source() ==
@@ -316,29 +292,23 @@ private:
       return false;
     }
     if (source() == ControlSource::kModelAction) {
-      const bool stop_required = modelStopRequired();
-      if (stop_required && !source_manager_->modelAvailable()) {
-        message = unavailableModelStopMessage();
+      source_manager_->suspendModelOutput();
+      publishHandoffHold();
+      try {
+        modes_.selectModel(mode);
+        source_manager_->activateSource(source(), modes_.modelModes().at(mode).directJoint());
+        model_action_input_->clear();
+        if (modes_.modelModes().at(mode).directJoint()) {runtime_.reset();} else {
+          runtime_ = std::make_unique<ControlRuntime>(
+            *this, robot_teleoperation_->followerKinematics());
+        }
+        syncCommandToFeedback();
+        feedback_.hold() = robot_teleoperation_->followerPosition();
+      } catch (const std::exception & error) {
+        failSourceSwitch(error.what(), "Mode change");
+        message = error.what();
         return false;
       }
-      source_manager_->stopModel(stop_required,
-        [this, mode](bool success, const std::string & reason) {
-          if (!success) {failSourceSwitch(reason, "Mode change"); return;}
-          publishHandoffHold();
-          try {
-            modes_.selectModel(mode);
-            source_manager_->activateSource(source(), modes_.modelModes().at(mode).directJoint());
-            model_action_input_->clear();
-            if (modes_.modelModes().at(mode).directJoint()) {runtime_.reset();} else {
-              runtime_ = std::make_unique<ControlRuntime>(
-                *this, robot_teleoperation_->followerKinematics());
-            }
-            syncCommandToFeedback();
-            feedback_.hold() = robot_teleoperation_->followerPosition();
-          } catch (const std::exception & error) {
-            failSourceSwitch(error.what(), "Mode change");
-          }
-        });
     } else {
       modes_.selectTeleop(mode, true);
       modes_.setPending(true);
@@ -363,12 +333,9 @@ private:
           "Model pose controller activated");
         RCLCPP_INFO(get_logger(), "Model mode %u prepared: %s",
           modes_.modelRequested(), entry.reference_type.c_str());
-        source_manager_->startModel(entry.directJoint(),
-          [this](bool success, const std::string & message) {
-            if (!success) {failSourceSwitch(message); return;}
-            RCLCPP_INFO(get_logger(), "Model mode %u ready", modes_.modelRequested());
-            if (source_manager_->transitioning()) {source_manager_->complete(source());}
-          });
+        source_manager_->startModel(entry.directJoint());
+        RCLCPP_INFO(get_logger(), "Model mode %u ready", modes_.modelRequested());
+        if (source_manager_->transitioning()) {source_manager_->complete(source());}
       }
       if (!source_manager_->modelGranted()) {return;}
       if (isDirectModelJoint()) {
@@ -1233,28 +1200,16 @@ private:
 
   void controlLoop()
   {
-    source_manager_->poll();
     if (!source_manager_->ready()) {return;}
-    if (source_manager_->modelPending()) {return;}
     if (!feedbackFresh()) {
       if (feedback_.expire(*robot_teleoperation_)) {
         active_groups_ = 0;
         if (model_action_input_) {model_action_input_->clear();}
         if (source() == ControlSource::kModelAction && source_manager_->modelGranted()) {
-          // Legacy direct publishers have no model service. Suspend observations,
-          // not their command path; recovery must never inject a hold or replay.
-          if (isDirectModelJoint() && !source_manager_->managedModel() &&
-            !source_manager_->modelAvailable())
-          {
-            source_manager_->suspendModelOutput();
-            modes_.invalidate();
-          } else {
-            source_manager_->stopModel(modelStopRequired(),
-              [this](bool success, const std::string & message) {
-                if (!success) {failSourceSwitch(message); return;}
-                modes_.invalidate();
-              });
-          }
+          // Suspend Cyclo output/observations; direct external commands bypass this node.
+          // Recovery must never inject a hold or replay an old direct command.
+          source_manager_->suspendModelOutput();
+          modes_.invalidate();
         }
         publishStatus(
           ControlStatus::kError,
@@ -1289,7 +1244,7 @@ private:
       if (source_manager_->transitioning()) {
         if (modes_.ready() && source_manager_->modelGranted()) {
           source_manager_->complete(source());
-        } else if (!source_manager_->modelPending()) {
+        } else {
           failSourceSwitch("Model action controller could not be activated");
         }
       }
@@ -1544,7 +1499,6 @@ private:
   ControlGroupMask requested_groups_ = 0, active_groups_ = 0;
   uint64_t transition_id_ = 0, next_transition_id_ = 0;
   bool groups_pending_ = false, leader_action_enabled_ = false;
-  bool source_stop_required_ = false;
   bool feedback_seen_for_log_ = false;
   uint8_t last_status_state_for_log_ = 0;
   std::string last_status_message_for_log_;

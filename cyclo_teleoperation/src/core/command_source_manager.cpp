@@ -21,7 +21,7 @@ namespace cyclo_teleoperation
 {
 CommandSourceManager::CommandSourceManager(rclcpp::Node & node, Switch change, Switch validate)
 : logger_(node.get_logger()), change_(std::move(change)), validate_(std::move(validate)),
-  ownership_(std::make_unique<RuntimeOwnership>(node, "/source")), model_session_(node)
+  ownership_(std::make_unique<RuntimeOwnership>(node, "/source"))
 {
   publisher_ = node.create_publisher<std_msgs::msg::String>(
     "/source", rclcpp::QoS(1).reliable().transient_local());
@@ -63,7 +63,6 @@ CommandSourceManager::~CommandSourceManager() = default;
 void CommandSourceManager::startDirect()
 {
   // Cold startup does not take command ownership from an existing LG2 publisher.
-  // Unlike a handoff, it must never request an external publisher to stop.
   pending_ = ControlSource::kModelAction;
   publish("switching");
 }
@@ -89,38 +88,11 @@ void CommandSourceManager::fail()
   complete(ControlSource::kNone);
 }
 
-void CommandSourceManager::stopModel(
-  bool required, ModelActionSession::Completion completion)
-{
-  suspendModelOutput();
-  // Only current external publishers require a stop acknowledgement.
-  // An available service alone must not turn an optional stop into a handoff.
-  if (!required) {
-    model_acknowledged_ = false;
-    completion(true, "");
-    return;
-  }
-  model_session_.request(false, required,
-    [this, completion](bool success, const std::string & message) {
-      if (success) {model_acknowledged_ = false;}
-      completion(success, message);
-    });
-}
-
-void CommandSourceManager::startModel(
-  bool direct, ModelActionSession::Completion completion)
+void CommandSourceManager::startModel(bool direct)
 {
   direct_ = direct;
-  const bool available = model_session_.available();
-  model_session_.request(true, false,
-    [this, direct, available, completion](bool success, const std::string & message) {
-      if (success) {
-        model_acknowledged_ = available;
-        model_granted_ = true;
-        joint_output_allowed_ = !direct;
-      }
-      completion(success, message);
-    });
+  model_granted_ = true;
+  joint_output_allowed_ = !direct;
 }
 
 bool CommandSourceManager::jointOutputAllowed() const

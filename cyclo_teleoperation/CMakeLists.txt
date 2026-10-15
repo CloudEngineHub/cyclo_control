@@ -93,7 +93,6 @@ ament_target_dependencies(cyclo_teleoperation_ai_worker_robot_plugin
 
 add_library(cyclo_teleoperation_node_runtime SHARED
   src/core/model_action_input.cpp
-  src/core/model_action_session.cpp
   src/core/mode_registry.cpp
   src/core/mode_manager.cpp
   src/core/feedback_state.cpp

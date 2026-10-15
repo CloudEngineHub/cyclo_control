@@ -30,7 +30,6 @@ public:
     std::function<bool()> enabled, std::function<std::string()> reference_type);
   void clear();
   ControlGroupMask freshGroups() const;
-  bool hasExternalActionPublishers() const;
   bool hasGripper(ControlGroupId group) const {return gripper_received_.at(group);}
   const GroupCartesianReferences & cartesianReferences() const {return poses_;}
 
@@ -51,7 +50,6 @@ private:
   rclcpp::Time reset_time_{0, 0, RCL_ROS_TIME};
   std::vector<rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr> joints_;
   std::vector<rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr> pose_inputs_;
-  std::vector<std::string> pose_topics_;
   std::vector<JointTrajectoryChannel> direct_channels_;
   std::vector<rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr>
   direct_inputs_;

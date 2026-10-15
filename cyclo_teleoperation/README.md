@@ -49,10 +49,8 @@ ros2 launch ffw_bringup ffw_a2_leader_ai.launch.py
 Both input paths are available. Startup is fixed to `model_action` and the unique
 mode with `reference_type: absolute_joint_position`, independent of its numeric ID.
 The `initial_source` and `default_model_action_mode` parameters are removed.
-Legacy LG2 publishers can use their existing topics without a model handshake
-service: Cyclo does not publish or replace joint commands at startup or feedback
-recovery. An actual handoff away from an external publisher still requires the
-stop acknowledgement described below. Holding both A2
+Legacy LG2 publishers can use their existing topics: Cyclo does not publish or
+replace joint commands at startup or feedback recovery. Holding both A2
 buttons toggles the source with both arms initially stopped; individual long
 presses enable/pause each arm in teleop. Both short presses switch head/swerve
 joystick mode. Joystick motion output is disabled in `model_action` source.
@@ -68,7 +66,6 @@ joystick mode. Joystick motion output is disabled in `model_action` source.
 | Selected source + heartbeat | `/source` (`std_msgs/msg/String`) |
 | Select source | `/set_source` (`std_srvs/srv/SetBool`: true=teleop) |
 | Toggle source | `/toggle_source` (`std_srvs/srv/Trigger`) |
-| External model publication handshake | `/model_action/set_enabled` (`std_srvs/srv/SetBool`, provided by the model) |
 | Select mode of the active source | `/set_mode` (`robotis_interfaces/srv/SetControlMode`) |
 
 Modes are registered independently in `control_modes` and `model_action_modes`; model
@@ -108,30 +105,21 @@ validation, velocity limits, startup interpolation and input watchdog. A silent 
 retains the follower controller's previous trajectory; Cyclo does not soft-hold it.
 Stopping publication does not cancel an already scheduled multi-point trajectory.
 
-### External model publisher contract
+### Source handoff
 
-For automatic model/teleop handoff, implement `/model_action/set_enabled`:
+No model start/stop service is required or called. Source and mode changes do not
+check external command publishers or recent arm-trajectory traffic. Existing
+mode/pose transition checks and the stopped-control-group requirement for mode
+changes remain in effect. After departing direct mode, Cyclo sends one measured
+hold to replace a pending follower trajectory before starting teleop or EEF control.
 
-- `data: false`: stop publication and discard pending model actions before returning
-  `success: true`. Do not acknowledge while another publishing thread can still send.
-- `data: true`: allow only newly generated actions for the selected `/control/status`
-  mode, and only while `/source` is `model_action` with a recent heartbeat.
-- Stop on `starting`, `switching`, `none`, `teleop`, missing source heartbeat or missing
-  follower feedback. Never resume cached actions after reconnecting.
-
-Cyclo waits for the stop acknowledgment before taking joint-output ownership. Refusal
-or a two-second timeout leaves both Cyclo output and Leader output disabled (`none`).
-If a direct publisher has been observed, or an external joint/pose action publisher
-is present in the ROS graph, a missing
-service blocks handoff. An idle system with no external publisher needs no service.
-After an acknowledged departure from direct mode, Cyclo sends one measured hold to
-replace a pending follower trajectory before starting teleop or EEF control.
-Follower timeout requests model publication stop; valid feedback permits a new session.
-
-This handshake is a cooperation protocol, not a follower-side topic firewall. Cyclo
-cannot block an uncooperative publisher, messages already in transport, or cancel the
-follower's trajectory during lost feedback. Model integration must honor ownership
-and bound scheduling horizons. Do not run independent publishers on the final topics.
+Models should publish newly generated actions only while `/source` is `model_action`
+with a recent heartbeat, and stop on `starting`, `switching`, `none`, `teleop`, missing
+heartbeat or missing follower feedback. Never resume cached actions after reconnecting.
+Cyclo cannot block external direct publications, including during teleop, or cancel a
+scheduled trajectory during lost feedback. Concurrent external and teleop commands can
+conflict at the follower. Integration must honor ownership and bound scheduling horizons.
+Follower timeout suspends Cyclo output; valid feedback rebases its references.
 
 For Cyclo-controlled paths, source switches discard old input, stop all groups and rebase the command on fresh
 feedback. Requests are rejected while a preset or mode-pose movement is in progress.
@@ -158,14 +146,14 @@ Do not launch a second runtime alongside an enabled follower runtime.
 
 `TeleoperationNode` connects ROS callbacks and the periodic control loop.
 `CommandSourceManager` owns source transitions and publication permissions, with
-`ModelActionSession` handling external publication and `RuntimeOwnership` guarding
-the output owner. `ModeManager` owns the selected plugin and exit/initial/activation
+`RuntimeOwnership` guarding the output owner. `ModeManager` owns the selected plugin and exit/initial/activation
 lifecycle; `ModeRegistry` resolves its YAML entries. `FeedbackState` owns feedback
 freshness, integrated command state and hold targets; it rebases commands only at
 explicit enable/recovery events, not every feedback callback.
 `PoseSequenceManager` retains preset/initial/exit interpolation, and `ControlRuntime`
 executes the shared QP. `ModelActionInput` validates EEF/gripper inputs and observes
-direct joint commands. These are ordinary classes, not additional ROS nodes.
+direct joint commands and their external receive times. These are ordinary classes,
+not additional ROS nodes.
 The robot plugin owns kinematics, ROS output and the existing
 `robotis_interfaces` bridge. Controller plugins only contribute `ModeOutput`;
 new plugins using the existing input types need no runtime or AI Worker C++ edits.
