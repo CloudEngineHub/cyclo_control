@@ -70,6 +70,18 @@ void FeedbackState::syncGroups(ControlGroupMask groups, const RobotTeleoperation
   }
 }
 
+void FeedbackState::syncObservedJoints(const RobotTeleoperation & robot)
+{
+  // Arms remain open-loop. Joints driven elsewhere (e.g. lift) are measurements,
+  // never integrated command variables or stale whole-robot hold targets.
+  for (int index = 0; index < robot.dof(); ++index) {
+    if (robot.modeConfiguration().controlsJoint(index)) {continue;}
+    position_[index] = robot.followerPosition()[index];
+    velocity_[index] = 0.0;
+    hold_[index] = position_[index];
+  }
+}
+
 void FeedbackState::captureHold(ControlGroupMask groups, const RobotTeleoperation & robot)
 {
   for (const auto & group : robot.modeConfiguration().control_groups) {

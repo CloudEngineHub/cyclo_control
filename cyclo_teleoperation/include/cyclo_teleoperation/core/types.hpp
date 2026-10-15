@@ -17,6 +17,7 @@
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -58,6 +59,8 @@ struct ControlGroupConfiguration
     std::string pose_parameter_name;
   };
   std::vector<AuxiliaryJoint> auxiliary_joints;
+  // Relative teleop anchors follow this observed frame (empty means the model root).
+  std::string follower_control_frame;
 };
 
 using GroupAuxiliaryPositions = std::vector<Eigen::VectorXd>;
@@ -164,7 +167,7 @@ struct ModeContext
   double now_seconds;
   double dt;
   // Action groups are enabled by an already validated fresh command. Teleop enable
-  // still waits for the next raw sample, whose duration was calculated after enable.
+  // still waits for the next raw sample carrying a valid duration candidate.
   bool reference_ready_on_enable = false;
 };
 
@@ -173,6 +176,21 @@ struct ModeConfiguration
   std::shared_ptr<cyclo_motion_controller::kinematics::KinematicsSolver> follower_kinematics;
   std::shared_ptr<cyclo_motion_controller::kinematics::KinematicsSolver> leader_kinematics;
   std::vector<ControlGroupConfiguration> control_groups;
+
+  bool controlsJoint(const int index) const
+  {
+    for (const auto & group : control_groups) {
+      const auto & indices = group.follower_joint_indices;
+      if (std::find(indices.begin(), indices.end(), index) != indices.end()) {return true;}
+    }
+    return false;
+  }
+
+  Eigen::Affine3d followerControlFramePose(const ControlGroupConfiguration & group) const
+  {
+    return group.follower_control_frame.empty() ? Eigen::Affine3d::Identity() :
+           follower_kinematics->getPose(group.follower_control_frame);
+  }
 
   const ControlGroupConfiguration * findGroup(const std::string & name) const
   {

@@ -204,12 +204,14 @@ bool AIWorkerTeleoperation::initialize()
       kLeftGroupId, "left", left_arm_indices_,
       node_->get_parameter(parameterName("follower_left_eef")).as_string(),
       node_->get_parameter(parameterName("leader_left_eef")).as_string(),
-      {{left_gripper_joint_, "gripper_position"}}},
+      {{left_gripper_joint_, "gripper_position"}}, "arm_base_link"},
     ControlGroupConfiguration{
       kRightGroupId, "right", right_arm_indices_,
       node_->get_parameter(parameterName("follower_right_eef")).as_string(),
       node_->get_parameter(parameterName("leader_right_eef")).as_string(),
-      {{right_gripper_joint_, "gripper_position"}}}};
+      {{right_gripper_joint_, "gripper_position"}}, "arm_base_link"}};
+  // Validate the control frame before accepting commands.
+  follower_kinematics_->computePose(follower_position_, "arm_base_link");
   control_group_states_.assign(mode_configuration_.control_groups.size(), ControlGroupState{});
   follower_auxiliary_position_.resize(mode_configuration_.control_groups.size());
   leader_auxiliary_reference_.resize(mode_configuration_.control_groups.size());

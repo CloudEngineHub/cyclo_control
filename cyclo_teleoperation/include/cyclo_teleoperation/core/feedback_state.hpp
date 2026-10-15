@@ -33,6 +33,7 @@ public:
   void resetCommand(const RobotTeleoperation & robot);
   void initializeAuxiliary(const RobotTeleoperation & robot);
   void syncGroups(ControlGroupMask groups, const RobotTeleoperation & robot);
+  void syncObservedJoints(const RobotTeleoperation & robot);
   void captureHold(ControlGroupMask groups, const RobotTeleoperation & robot);
   void updateOwnership(ControlGroupMask groups, const RobotTeleoperation & robot);
   void acceptLeader(ControlGroupId group, rclcpp::Time now);

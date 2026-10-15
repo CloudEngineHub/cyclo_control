@@ -26,8 +26,17 @@ class ControlRuntime
 public:
   ControlRuntime(
     rclcpp::Node & node,
-    std::shared_ptr<cyclo_motion_controller::kinematics::KinematicsSolver> robot)
-  : node_(node), qp_(std::move(robot)) {}
+    const ModeConfiguration & configuration)
+  : node_(node), qp_(configuration.follower_kinematics)
+  {
+    // Do not solve for joints which are absent from every output control group.
+    // Disabled arms remain soft-held; only externally driven joints are locked.
+    for (int index = 0; index < configuration.follower_kinematics->getDof(); ++index) {
+      if (!configuration.controlsJoint(index)) {
+        configuration.follower_kinematics->setJointVelocityBoundsByIndex(index, 0.0, 0.0);
+      }
+    }
+  }
   bool step(
     const ModeOutput & output, double dt, Eigen::VectorXd & position,
     Eigen::VectorXd & velocity)

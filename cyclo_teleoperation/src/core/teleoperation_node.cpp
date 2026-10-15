@@ -272,7 +272,7 @@ private:
     }
     if (teleop || !modes_.modelModes().at(modes_.modelRequested()).directJoint()) {
       runtime_ = std::make_unique<ControlRuntime>(*this,
-          robot_teleoperation_->followerKinematics());
+          robot_teleoperation_->modeConfiguration());
     } else {
       runtime_.reset();
     }
@@ -320,7 +320,7 @@ private:
         model_action_input_->clear();
         if (modes_.modelModes().at(mode).directJoint()) {runtime_.reset();} else {
           runtime_ = std::make_unique<ControlRuntime>(
-            *this, robot_teleoperation_->followerKinematics());
+            *this, robot_teleoperation_->modeConfiguration());
         }
         syncCommandToFeedback();
         feedback_.hold() = robot_teleoperation_->followerPosition();
@@ -1244,6 +1244,7 @@ private:
       syncCommandToFeedback();
       pose_sequences_->rebaseActiveSequences(makeContext(0));
     }
+    feedback_.syncObservedJoints(*robot_teleoperation_);
     if (source_manager_->exitPending()) {
       if (!updateModePoseTransition(true)) {
         failSourceSwitch("Exit pose could not be completed");

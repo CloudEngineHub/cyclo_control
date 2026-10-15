@@ -93,6 +93,32 @@ ignore inputs outside model EEF control and discard old references at handoff.
 The former `/command/{left,right}/pose` input is replaced by the shared action
 topic. The separate gripper-only joint input is unchanged.
 
+### Lift and Cartesian frames
+
+AI Worker relative teleop targets are held internally relative to `arm_base_link`.
+The measured lift position updates kinematics every cycle, but lift is not an
+arm QP command variable. In teleop, moving lift alone therefore does not make
+either arm counter-move to hold an old `base_link` height. Arm commands remain open-loop.
+
+Public EEF actions and states stay in `base_link`: teleop targets and measured
+states include the actual lift height. External EEF commands remain absolute
+`base_link` targets: if lift moves while that target is unchanged, the arm must
+compensate to maintain the commanded EEF pose, subject to the configured QP
+constraints. External action messages remain publisher-owned and are not echoed
+or rewritten by Cyclo. Direct external joint commands are unchanged.
+
+Robot plugins select `follower_control_frame` for each control group; the common
+relative controller uses it without robot names or numeric mode IDs. An empty
+frame preserves root-frame relative tracking for other robot plugins. Leader
+deltas retain the shared base axes even when the control frame is rotated. Joints
+outside all control groups are observed from feedback and locked in the arm QP;
+disabled arms still use the existing soft hold.
+
+New controllers reuse the synchronized `ModeContext` and shared QP runtime;
+they should not implement their own lift feedback or joint ownership handling.
+Only controllers with relative anchors use `followerControlFramePose()` to
+store/reconstruct those anchors. Absolute pose controllers keep absolute targets.
+
 Every `absolute_joint_position` mode is direct, regardless of its numeric ID. Do not
 specify a `plugin` or controller tuning for that mode. No plugin or QP is instantiated,
 and Cyclo publishes no joint commands, including holds, while direct mode is active.

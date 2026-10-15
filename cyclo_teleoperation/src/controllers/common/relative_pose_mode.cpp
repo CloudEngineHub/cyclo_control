@@ -82,7 +82,8 @@ void RelativePoseMode::captureAnchors(const ControlGroupMask groups)
     }
     auto & anchor = anchors_.at(group.id);
     anchor.leader = configuration_.leader_kinematics->getPose(group.leader_eef);
-    anchor.follower = configuration_.follower_kinematics->getPose(group.follower_eef);
+    anchor.follower = configuration_.followerControlFramePose(group).inverse() *
+      configuration_.follower_kinematics->getPose(group.follower_eef);
     anchor.valid = true;
   }
 }
@@ -108,13 +109,18 @@ bool RelativePoseMode::update(const ModeContext & context, ModeOutput & output)
         configuration_.follower_kinematics->getPose(group.follower_eef);
       const Eigen::Affine3d leader_current =
         configuration_.leader_kinematics->getPose(group.leader_eef);
-      // Apply relative leader motion in the shared base-link axes. Composing the complete
-      // transforms on the right would express translation in the anchored end-effector frame.
+      const Eigen::Affine3d base_from_control = configuration_.followerControlFramePose(group);
+      const Eigen::Matrix3d control_from_base_rotation = base_from_control.linear().transpose();
+      // Keep the anchor in the arm base, so lift motion cannot create an arm error.
+      // Leader deltas use the shared axes, not the anchored end-effector axes.
       Eigen::Affine3d goal = anchor.follower;
-      goal.translation() += leader_current.translation() - anchor.leader.translation();
+      goal.translation() += control_from_base_rotation *
+        (leader_current.translation() - anchor.leader.translation());
       const Eigen::Matrix3d base_frame_rotation_delta =
         leader_current.linear() * anchor.leader.linear().transpose();
-      goal.linear() = base_frame_rotation_delta * anchor.follower.linear();
+      goal.linear() = control_from_base_rotation * base_frame_rotation_delta *
+        base_from_control.linear() * anchor.follower.linear();
+      goal = base_from_control * goal;
       output.eef_pose_references.push_back(EefPoseReference{group.id, goal});
       TaskObjective task;
       task.link_name = group.follower_eef;
