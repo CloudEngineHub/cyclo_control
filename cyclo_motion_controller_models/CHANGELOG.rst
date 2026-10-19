@@ -2,6 +2,12 @@
 Changelog for package cyclo_motion_controller_models
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.5.0 (2026-10-19)
+------------------
+* Added BG2, F1, F2, BH5, and SH5 follower models and associated collision configurations
+* Added the A2 calculation model and moved A2 and LG2 leader models into a dedicated leader directory
+* Contributors: Yeonguk Kim
+
 0.4.1 (2026-09-21)
 ------------------
 * None

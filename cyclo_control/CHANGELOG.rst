@@ -2,6 +2,13 @@
 Changelog for package cyclo_control
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.5.0 (2026-10-19)
+------------------
+* Unified teleoperation and external action control with shared controller plugins and source handoff
+* Added reusable leader-reference calculation, fixed-duration slow start, and lift-aware Cartesian control
+* Added AI Worker follower models and separated leader models from follower models
+* Contributors: Yeonguk Kim
+
 0.4.1 (2026-09-21)
 ------------------
 * Hardened teleoperation input and follower-feedback recovery handling
