@@ -59,6 +59,14 @@ This repository provides control packages for the ROBOTIS Physical AI lineup.
 │   │   └── ...
 │   ├── CMakeLists.txt
 │   └── package.xml
+├── cyclo_teleoperation/
+│   ├── include/cyclo_teleoperation/
+│   │   ├── controllers/
+│   │   ├── core/
+│   │   └── robots/
+│   ├── src/
+│   ├── CMakeLists.txt
+│   └── package.xml
 └── osqp_eigen_vendor/
     ├── cmake/
     ├── third_party/
@@ -102,6 +110,13 @@ This repository provides control packages for the ROBOTIS Physical AI lineup.
 - `launch/`: Launch files for visualizing robot models.
 - `models/`: URDF/SRDF robot models used by the controller.
 
+`cyclo_teleoperation/`
+
+- Plugin-based runtime for leader teleoperation and model-action control.
+- Loads robot and control-mode plugins while sharing follower feedback handling, QP constraints,
+  soft hold, and safe mode transitions.
+- See [`cyclo_teleoperation/README.md`](cyclo_teleoperation/README.md) for configuration details.
+
 `osqp_eigen_vendor/`
 
 - Vendor package that wraps the upstream `osqp-eigen` source tree for this repository.
@@ -136,6 +151,16 @@ source install/setup.bash
 ```
 
 ## Run
+
+### Teleoperation and Model Action Control
+
+The `cyclo_teleoperation` package provides one `cyclo_teleoperation_node` for both leader-driven
+teleoperation and model-action control, selected through the command-source interface. Robot-specific
+repositories provide follower profiles, leader references, and controller-mode configuration.
+Both input paths are available in this single executable; no separate model-action node is needed.
+Model absolute joint actions go directly to the follower's legacy joint trajectory topics,
+without a Cyclo plugin or QP. Absolute EEF actions retain plugin/QP conversion.
+See the package README for the model publisher handoff contract and direct-control limitations.
 
 ### AI Worker Controllers
 

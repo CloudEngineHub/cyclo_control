@@ -11,11 +11,48 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(cyclo_motion_controller_core REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(robotis_interfaces REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
+
+# Public robot/controller plugin API, independent of AI Worker implementations.
+add_library(cyclo_teleoperation_interfaces INTERFACE)
+target_include_directories(cyclo_teleoperation_interfaces INTERFACE
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+target_compile_features(cyclo_teleoperation_interfaces INTERFACE cxx_std_17)
+target_link_libraries(cyclo_teleoperation_interfaces INTERFACE
+  cyclo_motion_controller_core::cyclo_motion_controller_core
+  Eigen3::Eigen
+)
+ament_target_dependencies(cyclo_teleoperation_interfaces INTERFACE
+  geometry_msgs pluginlib rclcpp sensor_msgs std_msgs std_srvs trajectory_msgs)
+
+add_library(cyclo_teleoperation_runtime SHARED
+  src/core/controller_constraints.cpp
+  src/core/fixed_duration_slow_start.cpp
+  src/core/joint_trajectory_interpolator.cpp
+)
+
+add_library(cyclo_teleoperation_leader_reference SHARED
+  src/core/leader_pose_reference.cpp
+)
+target_link_libraries(cyclo_teleoperation_leader_reference PUBLIC
+  cyclo_teleoperation_interfaces
+)
+target_include_directories(cyclo_teleoperation_runtime PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+target_link_libraries(cyclo_teleoperation_runtime PUBLIC
+    cyclo_teleoperation_interfaces
+)
 
 add_library(cyclo_teleoperation_qp SHARED
   src/core/soft_hold.cpp
@@ -31,14 +68,15 @@ target_link_libraries(cyclo_teleoperation_qp PUBLIC
 )
 
 add_library(cyclo_teleoperation_common_controller_plugins SHARED
+  src/controllers/common/absolute_pose_mode.cpp
   src/controllers/common/movej_mode.cpp
-  src/controllers/common/relative_pose_mode.cpp
 )
 target_include_directories(cyclo_teleoperation_common_controller_plugins PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
 target_link_libraries(cyclo_teleoperation_common_controller_plugins
+  cyclo_teleoperation_runtime
   cyclo_motion_controller_core::cyclo_motion_controller_core
   Eigen3::Eigen
 )
@@ -57,23 +95,35 @@ target_link_libraries(cyclo_teleoperation_ai_worker_robot_plugin
   Eigen3::Eigen
 )
 ament_target_dependencies(cyclo_teleoperation_ai_worker_robot_plugin
-  pluginlib rclcpp robotis_interfaces sensor_msgs trajectory_msgs)
+  geometry_msgs pluginlib rclcpp robotis_interfaces sensor_msgs trajectory_msgs)
 
-add_executable(cyclo_teleoperation_node
+add_library(cyclo_teleoperation_node_runtime SHARED
+  src/core/action_input.cpp
+  src/core/mode_registry.cpp
+  src/core/mode_manager.cpp
+  src/core/feedback_state.cpp
+  src/core/command_source_manager.cpp
+  src/core/runtime_ownership.cpp
   src/core/pose_sequence_manager.cpp
   src/core/teleoperation_node.cpp
-  src/cyclo_teleoperation_main.cpp
 )
-target_include_directories(cyclo_teleoperation_node PRIVATE
+target_include_directories(cyclo_teleoperation_node_runtime PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
-target_link_libraries(cyclo_teleoperation_node
+target_link_libraries(cyclo_teleoperation_node_runtime
+  cyclo_teleoperation_runtime
   cyclo_teleoperation_qp
   cyclo_motion_controller_core::cyclo_motion_controller_core
   Eigen3::Eigen
 )
-ament_target_dependencies(cyclo_teleoperation_node
-  pluginlib rclcpp sensor_msgs trajectory_msgs)
+ament_target_dependencies(cyclo_teleoperation_node_runtime
+  geometry_msgs pluginlib rclcpp sensor_msgs std_msgs std_srvs trajectory_msgs)
+
+# Both input sources share one process and switch through the source interface.
+add_executable(cyclo_teleoperation_node src/cyclo_teleoperation_main.cpp)
+target_include_directories(cyclo_teleoperation_node PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(cyclo_teleoperation_node cyclo_teleoperation_node_runtime)
+ament_target_dependencies(cyclo_teleoperation_node rclcpp)
 
 pluginlib_export_plugin_description_file(
   cyclo_teleoperation cyclo_teleoperation_controller_plugins.xml)
@@ -81,7 +131,16 @@ pluginlib_export_plugin_description_file(
   cyclo_teleoperation cyclo_teleoperation_robot_plugins.xml)
 
 install(TARGETS
+  cyclo_teleoperation_interfaces
+  cyclo_teleoperation_leader_reference
   cyclo_teleoperation_qp
+  cyclo_teleoperation_runtime
+  EXPORT cyclo_teleoperationTargets
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+)
+install(TARGETS
+  cyclo_teleoperation_node_runtime
   cyclo_teleoperation_common_controller_plugins
   cyclo_teleoperation_ai_worker_robot_plugin
   cyclo_teleoperation_node
@@ -96,6 +155,9 @@ install(FILES
   DESTINATION share/${PROJECT_NAME})
 
 ament_export_include_directories(include)
-ament_export_dependencies(cyclo_motion_controller_core Eigen3 pluginlib rclcpp)
+ament_export_targets(cyclo_teleoperationTargets HAS_LIBRARY_TARGET)
+ament_export_dependencies(
+  cyclo_motion_controller_core Eigen3 geometry_msgs pluginlib rclcpp
+  sensor_msgs std_msgs std_srvs trajectory_msgs)
 
 ament_package()

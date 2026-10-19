@@ -148,6 +148,7 @@ def generate_launch_description():
                     FindPackageShare('cyclo_motion_controller_models'),
                     'models',
                     'ai_worker',
+                    'leader',
                     'ffw_lg2_leader.urdf',
                 ]
             ),

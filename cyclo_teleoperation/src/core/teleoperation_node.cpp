@@ -37,18 +37,45 @@
 #include "cyclo_teleoperation/core/teleoperation_node.hpp"
 #include "cyclo_teleoperation/core/soft_hold.hpp"
 #include "cyclo_teleoperation/core/pose_sequence_manager.hpp"
+#include "cyclo_teleoperation/core/action_input.hpp"
+#include "cyclo_teleoperation/core/control_runtime.hpp"
+#include "cyclo_teleoperation/core/mode_manager.hpp"
+#include "cyclo_teleoperation/core/feedback_state.hpp"
+#include "cyclo_teleoperation/core/command_source_manager.hpp"
 
 namespace cyclo_teleoperation
 {
+namespace
+{
+// Preserve status/service text on the wire; only human-readable log labels change.
+std::string controlLogMessage(std::string message)
+{
+  for (const auto & label : {
+        std::make_pair("Direct model joint", "Direct external joint"),
+        std::make_pair("Model pose", "External pose"),
+        std::make_pair("Model action", "External control")})
+  {
+    const auto offset = message.find(label.first);
+    if (offset != std::string::npos) {
+      message.replace(offset, std::char_traits<char>::length(label.first), label.second);
+    }
+  }
+  return message;
+}
+}  // namespace
+
 class TeleoperationNode : public rclcpp::Node
 {
 public:
   TeleoperationNode()
   : Node("cyclo_teleoperation"),
-    robot_loader_("cyclo_teleoperation", "cyclo_teleoperation::RobotTeleoperation"),
-    mode_loader_("cyclo_teleoperation", "cyclo_teleoperation::TeleoperationMode")
+    robot_loader_("cyclo_teleoperation", "cyclo_teleoperation::RobotTeleoperation")
   {
     declareParameters();
+    // Claim ownership before creating robot publishers or mode services.
+    source_manager_ = std::make_unique<CommandSourceManager>(*this,
+        [this](ControlSource source) {beginSourceSwitch(source);},
+        [this](ControlSource) {validateSourceSwitch();});
     const auto robot_plugin = get_parameter("robot.plugin").as_string();
     if (robot_plugin.empty() || !robot_loader_.isClassAvailable(robot_plugin)) {
       throw std::runtime_error(
@@ -73,12 +100,6 @@ public:
       throw std::runtime_error("Failed to configure pose sequences");
     }
 
-    qp_ = std::make_unique<TeleoperationQP>(robot_teleoperation_->followerKinematics());
-    qp_->setControllerParameters(
-      get_parameter("constraints.slack_penalty").as_double(),
-      get_parameter("constraints.cbf_alpha").as_double(),
-      get_parameter("constraints.collision_buffer").as_double(),
-      get_parameter("constraints.collision_safe_distance").as_double());
 
     const auto follower_qos = rclcpp::SensorDataQoS().keep_last(1);
     follower_subscription_ = create_subscription<sensor_msgs::msg::JointState>(
@@ -88,8 +109,7 @@ public:
     for (const auto & group : robot_teleoperation_->modeConfiguration().control_groups) {
       group_state_count = std::max(group_state_count, static_cast<size_t>(group.id) + 1);
     }
-    leader_received_.assign(group_state_count, false);
-    last_leader_times_.assign(group_state_count, rclcpp::Time(0, 0, RCL_ROS_TIME));
+    feedback_.configure(group_state_count);
     selected_preset_ids_.assign(group_state_count, 1);
     context_group_states_.assign(group_state_count, ControlGroupState{});
     last_preset_states_.assign(group_state_count, 0);
@@ -102,27 +122,60 @@ public:
           [this, group = channel.group_id](
             const trajectory_msgs::msg::JointTrajectory::SharedPtr message)
           {
+            if (!leader_action_enabled_) {return;}
             if (robot_teleoperation_->updateLeaderReference(*message, group)) {
-              leader_received_.at(group) = true;
-              last_leader_times_.at(group) = now();
+              feedback_.acceptLeader(group, now());
             }
           }));
     }
 
-    requested_control_mode_ =
-      static_cast<uint16_t>(get_parameter("default_control_mode").as_int());
+    {
+      action_input_ = std::make_unique<ActionInput>(*this, *robot_teleoperation_,
+          [this]() {
+            return modes_.ready() && feedbackFresh() &&
+                   ((source() == ControlSource::kModelAction && source_manager_->modelGranted()) ||
+                   (source() == ControlSource::kTeleoperation && teleopPoseMode()));
+                                                            },
+          [this]() {
+            return source() == ControlSource::kModelAction ?
+                   modes_.modelModes().at(modes_.modelRequested()).reference_type :
+                   modes_.teleopModes().at(modes_.requested()).reference_type;
+          },
+          [this]() {
+            return teleopPoseMode() ? get_parameter(
+              modes_.teleopModes().at(modes_.requested()).parameter_prefix +
+              ".pose_anchor_frame").as_string() : std::string{};
+          });
+    }
+    robot_teleoperation_->setModeRequestCallback(
+      [this](uint16_t mode, uint64_t & id, std::string & message) {
+        const bool accepted = requestMode(mode, id, message);
+        if (accepted) {
+          RCLCPP_INFO(get_logger(), "Mode %u change accepted; waiting for activation", mode);
+        } else {
+          message = "Mode change rejected: " + message;
+          RCLCPP_WARN(get_logger(), "%s (requested mode=%u)", message.c_str(), mode);
+        }
+        return accepted;
+      });
     parameter_callback_handle_ = add_on_set_parameters_callback(
       [this](const std::vector<rclcpp::Parameter> & parameters) {
         rcl_interfaces::msg::SetParametersResult result;
         result.successful = true;
         for (const auto & parameter : parameters) {
           const std::string active_prefix =
-          "control_modes." + std::to_string(active_control_mode_) + ".";
+          (source() == ControlSource::kModelAction ? "model_action_modes." : "control_modes.") +
+          std::to_string(modes_.active()) + ".";
           if (
-            active_control_mode_ != 0 &&
+            modes_.active() != 0 &&
             parameter.get_name().rfind(active_prefix, 0) == 0)
           {
-            transition_pending_ = true;
+            if (source() == ControlSource::kModelAction) {
+              modes_.requestReconfigure(false);
+              action_input_->clear();
+            } else {
+              modes_.requestReconfigure(true);
+            }
           }
         }
         return result;
@@ -131,25 +184,260 @@ public:
     timer_ = create_wall_timer(
       std::chrono::duration<double>(1.0 / frequency),
       std::bind(&TeleoperationNode::controlLoop, this));
+    RCLCPP_INFO(get_logger(), "Waiting for complete follower feedback on '%s'",
+      follower_subscription_->get_topic_name());
     publishStatus(
       ControlStatus::kHolding,
       "Waiting for complete follower feedback");
+    source_manager_->startDirect();
+    switchSource(ControlSource::kModelAction);
   }
 
 private:
-  enum class ModeTransitionPhase : uint8_t
+  void validateSourceSwitch()
   {
-    kIdle,
-    kExitPose,
-    kInitialPose,
-    kActivate,
-  };
+    if (source() == ControlSource::kTeleoperation && modes_.ready() &&
+      pose_sequences_->hasExitPose(modes_.active()) && !feedbackFresh())
+    {
+      throw std::runtime_error("Fresh follower feedback is required for the exit pose");
+    }
+    if (modes_.started() || modes_.pending() ||
+      preset_update_pending_groups_ != 0 || final_initial_pose_update_pending_groups_ != 0 ||
+      pose_sequences_->movingPresetGroups() != 0 ||
+      pose_sequences_->movingFinalInitialPoseGroups() != 0)
+    {
+      throw std::runtime_error("Wait for the current mode/pose transition to finish");
+    }
+  }
+
+  void failSourceSwitch(const std::string & reason, const char * operation = nullptr)
+  {
+    RCLCPP_ERROR(get_logger(), "%s failed: %s; control source set to none",
+      operation ? operation :
+      source_manager_->transitioning() ? "Control source change" : "External control update",
+      controlLogMessage(reason).c_str());
+    setLeaderActionEnabled(false);
+    modes_.deactivate();
+    modes_.cancelTransition(*pose_sequences_);
+    source_manager_->fail();
+  }
+
+  void beginSourceSwitch(const ControlSource target)
+  {
+    source_manager_->suspendModelOutput();
+    publishHandoffHold();
+    source_manager_->allowJointOutput(source() == ControlSource::kTeleoperation);
+    beginSourceSwitchAfterStop(target);
+  }
+
+  ControlSource source() const {return source_manager_->activeSource();}
+
+  void publishHandoffHold()
+  {
+    // Replace a pending direct trajectory with measured feedback at handoff.
+    // Never called at startup/recovery; external publishers are not stopped by this hold.
+    if (isDirectModelJoint() && feedbackFresh()) {
+      robot_teleoperation_->publish(robot_teleoperation_->followerPosition(),
+        robot_teleoperation_->followerAuxiliaryPosition());
+    }
+  }
+
+  bool isDirectModelJoint() const {return source_manager_->direct();}
+
+  void beginSourceSwitchAfterStop(const ControlSource target)
+  {
+    try {
+      if (source() == ControlSource::kTeleoperation && modes_.ready() &&
+        pose_sequences_->hasExitPose(modes_.active()))
+      {
+        const auto departing_mode = modes_.active();
+        setLeaderActionEnabled(false);
+        modes_.deactivate();
+        if (!pose_sequences_->startExitPose(departing_mode, makeContext(0))) {
+          throw std::runtime_error("Cannot start source exit pose");
+        }
+        source_manager_->waitForExit(target);
+      } else {
+        switchSource(target);
+      }
+    } catch (const std::exception & error) {
+      failSourceSwitch(error.what());
+    }
+  }
+
+  void switchSource(const ControlSource source)
+  {
+    // This method and both input callbacks run in the same callback group. Closing the
+    // output before resetting references gives a single, atomic publication boundary.
+    source_manager_->activateSource(ControlSource::kNone, false);
+    modes_.selectSource(source == ControlSource::kTeleoperation);
+    const bool teleop = source == ControlSource::kTeleoperation;
+    leader_action_enabled_ = !teleop;
+    setLeaderActionEnabled(teleop);
+    feedback_.clearLeaders();
+    if (action_input_) {action_input_->clear();}
+    if (!robot_teleoperation_->selectControlSource(teleop ? "teleop" : "model_action")) {
+      throw std::runtime_error("Robot model rejected source selection");
+    }
+    if (teleop || !modes_.modelModes().at(modes_.modelRequested()).directJoint()) {
+      runtime_ = std::make_unique<ControlRuntime>(*this,
+          robot_teleoperation_->modeConfiguration());
+    } else {
+      runtime_.reset();
+    }
+    if (!pose_sequences_->configure(*this, robot_teleoperation_->modeConfiguration(),
+        get_parameter("available_control_modes").as_integer_array(),
+        get_parameter("available_presets").as_integer_array()))
+    {
+      throw std::runtime_error("Failed to reconfigure pose sequences");
+    }
+    modes_.setPending(teleop);
+    source_manager_->activateSource(source,
+      !teleop && modes_.modelModes().at(modes_.modelRequested()).directJoint());
+    publishStatus(ControlStatus::kHolding, "Preparing source; all teleoperation requests cleared");
+  }
+
+  bool requestMode(const uint16_t mode, uint64_t & id, std::string & message)
+  {
+    id = 0;
+    if (source_manager_->transitioning()) {
+      message = "A source change is in progress";
+      return false;
+    }
+    const auto & registry = source() ==
+      ControlSource::kModelAction ? modes_.modelModes() : modes_.teleopModes();
+    if (source() == ControlSource::kNone || !registry.contains(mode)) {
+      message = source() == ControlSource::kNone ? "No control source is active" :
+        "Mode " + std::to_string(mode) + " is not configured for the current source";
+      return false;
+    }
+    if (active_groups_ != 0 || requested_groups_ != 0 || modes_.started() ||
+      preset_update_pending_groups_ != 0 || final_initial_pose_update_pending_groups_ != 0 ||
+      pose_sequences_->movingPresetGroups() != 0 ||
+      pose_sequences_->movingFinalInitialPoseGroups() != 0)
+    {
+      message = (active_groups_ != 0 || requested_groups_ != 0) ?
+        "Stop all active control groups first" : "A mode or pose movement is in progress";
+      return false;
+    }
+    if (source() == ControlSource::kModelAction) {
+      source_manager_->suspendModelOutput();
+      publishHandoffHold();
+      try {
+        modes_.selectModel(mode);
+        source_manager_->activateSource(source(), modes_.modelModes().at(mode).directJoint());
+        action_input_->clear();
+        if (modes_.modelModes().at(mode).directJoint()) {runtime_.reset();} else {
+          runtime_ = std::make_unique<ControlRuntime>(
+            *this, robot_teleoperation_->modeConfiguration());
+        }
+        syncCommandToFeedback();
+        feedback_.hold() = robot_teleoperation_->followerPosition();
+      } catch (const std::exception & error) {
+        failSourceSwitch(error.what(), "Mode change");
+        message = error.what();
+        return false;
+      }
+    } else {
+      modes_.selectTeleop(mode, true);
+      modes_.setPending(true);
+    }
+    modes_.recordRequest(mode);
+    id = transition_id_ = ++next_transition_id_;
+    message = "Mode request accepted";
+    publishStatus(ControlStatus::kHolding, message);
+    return true;
+  }
+
+  void updateModelAction()
+  {
+    try {
+      if (!modes_.ready()) {
+        const auto & entry = modes_.modelModes().at(modes_.modelRequested());
+        modes_.activateModel(*this, robot_teleoperation_->modeConfiguration(), makeContext(0));
+        active_groups_ = 0;
+        action_input_->clear();
+        publishStatus(ControlStatus::kHolding, entry.directJoint() ?
+          "Direct model joint mode selected; Cyclo joint output and QP are disabled" :
+          "Model pose controller activated");
+        source_manager_->startModel(entry.directJoint());
+        RCLCPP_INFO(get_logger(), "External mode %u ready: %s (%s)",
+          modes_.modelRequested(), entry.reference_type.c_str(),
+            entry.directJoint() ? "direct" : "QP");
+        if (source_manager_->transitioning()) {source_manager_->complete(source());}
+      }
+      if (!source_manager_->modelGranted()) {return;}
+      if (isDirectModelJoint()) {
+        const auto observed = action_input_->freshGroups();
+        if (active_groups_ != observed) {
+          active_groups_ = observed;
+          publishStatus(ControlStatus::kHolding,
+            observed != 0 ?
+            "Direct model joint input observed; Cyclo joint output is disabled" :
+            "Direct model joint input expired; Cyclo cannot stop external joint commands");
+        }
+        return;
+      }
+      const auto desired = action_input_->freshGroups();
+      const auto changed = desired ^ active_groups_;
+      const auto enabled = desired & ~active_groups_;
+      if (changed != 0) {
+        captureGroupHoldTarget(changed);
+        syncGroupCommandToFeedback(changed);
+        active_groups_ = desired;
+        if (enabled != 0) {modes_.plugin()->onGroupsEnabled(enabled, makeContext(active_groups_));}
+      }
+      const auto context = makeContext(active_groups_);
+      const auto owned = modes_.plugin()->controlledGroups(context);
+      updateControlledGroupOwnership(owned);
+      if (owned == 0) {
+        feedback_.position() = feedback_.hold();
+        feedback_.velocity().setZero();
+        publishCommand(feedback_.position());
+        return;
+      }
+      robot_teleoperation_->followerKinematics()->updateState(feedback_.position(),
+          feedback_.velocity());
+      ModeOutput output;
+      output.reset(robot_teleoperation_->dof(),
+        get_parameter("constraints.damping_weight").as_double());
+      if (!modes_.plugin()->update(context, output)) {
+        publishCommand(feedback_.position());
+        return;
+      }
+      applySoftHold(output, feedback_.position(), feedback_.hold(),
+        robot_teleoperation_->modeConfiguration().control_groups, owned,
+        get_parameter("hold.kp").as_double(),
+        get_parameter("hold.max_correction_velocity").as_double(),
+        get_parameter("hold.tracking_weight").as_double());
+      if (!runtime_->step(output, context.dt, feedback_.position(), feedback_.velocity())) {
+        model_qp_failed_for_log_ = true;
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+          "External control QP failed; holding the last command and retrying");
+      } else if (model_qp_failed_for_log_) {
+        model_qp_failed_for_log_ = false;
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000, "External control QP recovered");
+      }
+      publishCommand(feedback_.position(), &output);
+    } catch (const std::exception & error) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000, "%s",
+        controlLogMessage(error.what()).c_str());
+      modes_.deactivate();
+      action_input_->clear();
+      active_groups_ = 0;
+      feedback_.resetOwnership();
+      feedback_.hold() = robot_teleoperation_->followerPosition();
+      syncCommandToFeedback();
+      publishCommand(feedback_.position());
+    }
+  }
+
 
   void validateRobotConfiguration() const
   {
     const auto & configuration = robot_teleoperation_->modeConfiguration();
     const int dof = robot_teleoperation_->dof();
-    if (dof <= 0 || !configuration.follower_kinematics || !configuration.leader_kinematics) {
+    if (dof <= 0 || !configuration.follower_kinematics) {
       throw std::runtime_error("Robot profile has an invalid model configuration");
     }
     if (
@@ -242,7 +530,6 @@ private:
     declare_parameter("robot.plugin", "");
     declare_parameter("robot.parameter_prefix", "");
     declare_parameter("control_frequency", 100.0);
-    declare_parameter("trajectory_time", 0.0);
     declare_parameter("joint_state_timeout", 0.5);
     declare_parameter("leader_command_timeout", 0.5);
 
@@ -260,6 +547,7 @@ private:
     declare_parameter<std::vector<int64_t>>(
       "available_control_modes", std::vector<int64_t>{});
     declare_parameter("default_control_mode", 1);
+    modes_.configure(*this);
     const auto control_modes =
       get_parameter("available_control_modes").as_integer_array();
     if (control_modes.empty()) {
@@ -271,27 +559,10 @@ private:
         throw std::runtime_error("Control mode IDs must be in the uint16 range");
       }
       const auto mode = static_cast<uint16_t>(raw_mode);
-      if (mode_plugins_.find(mode) != mode_plugins_.end()) {
-        throw std::runtime_error(
-                "Duplicate control mode ID in available_control_modes: " +
-                std::to_string(mode));
-      }
       const std::string prefix = "control_modes." + std::to_string(mode);
       const std::string mode_name =
-        declare_parameter(prefix + ".name", "mode_" + std::to_string(mode));
-      const std::string plugin_name = declare_parameter(prefix + ".plugin", "");
-      if (mode_name.empty()) {
-        throw std::runtime_error(prefix + ".name must not be empty");
-      }
-      if (plugin_name.empty()) {
-        throw std::runtime_error(prefix + ".plugin must be configured in the parameter YAML");
-      }
-      if (!mode_loader_.isClassAvailable(plugin_name)) {
-        throw std::runtime_error(
-                prefix + ".plugin is not registered with pluginlib: " + plugin_name);
-      }
-      mode_names_[mode] = mode_name;
-      mode_plugins_[mode] = plugin_name;
+        declare_parameter(prefix + ".name", "modes_.plugin()" + std::to_string(mode));
+      if (mode_name.empty()) {throw std::runtime_error(prefix + ".name must not be empty");}
       for (const auto & sequence_name : {std::string("initial_pose"), std::string("exit_pose")}) {
         const std::string sequence_prefix = prefix + "." + sequence_name;
         declare_parameter(sequence_prefix + ".enabled", false);
@@ -309,15 +580,6 @@ private:
         declare_parameter(sequence_prefix + ".timeout", 10.0);
       }
     }
-    const int64_t raw_default_mode = get_parameter("default_control_mode").as_int();
-    if (
-      raw_default_mode <= 0 || raw_default_mode > UINT16_MAX ||
-      mode_plugins_.find(static_cast<uint16_t>(raw_default_mode)) == mode_plugins_.end())
-    {
-      throw std::runtime_error(
-              "default_control_mode must reference an ID in available_control_modes");
-    }
-
     declare_parameter<std::vector<int64_t>>("available_presets", {1});
     const auto preset_ids = get_parameter("available_presets").as_integer_array();
     for (const int64_t raw_id : preset_ids) {
@@ -388,11 +650,7 @@ private:
     }
   }
 
-  bool isModeAvailable(const uint16_t mode) const
-  {
-    const auto iter = mode_plugins_.find(mode);
-    return iter != mode_plugins_.end() && !iter->second.empty();
-  }
+  bool isModeAvailable(const uint16_t mode) const {return modes_.available(mode);}
 
   bool areSelectedPresetsAvailable(
     const ControlGroupMask target_groups,
@@ -421,22 +679,94 @@ private:
     if (!robot_teleoperation_->updateFollowerState(*message)) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "Follower state does not contain every joint required by robot profile '%s'",
-        robot_teleoperation_->robotName().c_str());
+        "Follower feedback ignored on '%s': incomplete or invalid joint state for '%s'",
+        follower_subscription_->get_topic_name(), robot_teleoperation_->robotName().c_str());
       return;
     }
-    last_follower_time_ = now();
-    follower_received_ = true;
-    if (!hold_initialized_) {
-      hold_target_ = robot_teleoperation_->followerPosition();
-      syncCommandToFeedback();
-      hold_initialized_ = true;
-      transition_pending_ = true;
+    if (!feedback_seen_for_log_) {
+      RCLCPP_INFO(get_logger(), "Complete follower feedback received");
+      feedback_seen_for_log_ = true;
+    } else if (!feedbackFresh()) {
+      RCLCPP_INFO(get_logger(),
+          "Follower feedback recovered; resetting references to current state");
     }
+    const auto received = feedback_.accept(now(), get_parameter("joint_state_timeout").as_double());
+    if (action_input_) {action_input_->observeFrames(message->header);}
+    if (received.interrupted) {active_groups_ = 0;}
+    if (received.recovering && action_input_) {
+      action_input_->clear();
+    }
+    if (source() == ControlSource::kNone) {
+      feedback_.hold() = robot_teleoperation_->followerPosition();
+      syncCommandToFeedback();
+      feedback_.setHoldInitialized(true);
+      return;
+    }
+    if (source_manager_ && source_manager_->ready()) {
+      robot_teleoperation_->publishFollowerEefState(message->header);
+    }
+    if (!feedback_.holdInitialized()) {
+      feedback_.hold() = robot_teleoperation_->followerPosition();
+      syncCommandToFeedback();
+      feedback_.setHoldInitialized(true);
+      modes_.setPending(true);
+    }
+  }
+
+  void setLeaderActionEnabled(const bool enabled)
+  {
+    if (enabled == leader_action_enabled_) {
+      return;
+    }
+
+    leader_action_enabled_ = enabled;
+    if (action_input_) {action_input_->clear();}
+    requested_groups_ = 0;
+    active_groups_ = 0;
+    feedback_.resetOwnership();
+    groups_pending_ = false;
+    preset_update_pending_groups_ = 0;
+    preset_cancel_pending_groups_ = 0;
+    final_initial_pose_update_pending_groups_ = 0;
+    final_initial_pose_cancel_pending_groups_ = 0;
+    if (pose_sequences_) {
+      pose_sequences_->cancelPresets(allGroups());
+      pose_sequences_->cancelFinalInitialPoses(allGroups());
+      pose_sequences_->cancelInitialPose();
+      pose_sequences_->cancelExitPose();
+    }
+    modes_.cancelTransition(*pose_sequences_);
+    if (feedbackFresh()) {
+      feedback_.hold() = robot_teleoperation_->followerPosition();
+      syncCommandToFeedback();
+      feedback_.setHoldInitialized(true);
+    } else {
+      feedback_.invalidateCommand();
+      feedback_.setHoldInitialized(false);
+    }
+    modes_.setPending(enabled && (!modes_.ready() || modes_.active() != modes_.requested()));
+    publishStatus(
+      ControlStatus::kHolding,
+      enabled ?
+      "Leader action output enabled; all teleoperation requests cleared" :
+      "Leader action output disabled; awaiting source handoff");
   }
 
   void commandCallback(const ControlRequest & request)
   {
+    if (source_manager_->transitioning()) {return;}
+    next_transition_id_ = std::max(next_transition_id_, request.transition_id);
+    if (source() != ControlSource::kTeleoperation) {
+      // A stopped teleop configuration can be selected while model action input owns the robot.
+      // It must never modify the active model action mode or active groups.
+      if (request.enabled_groups == 0 && request.preset_target_groups == 0 &&
+        request.initial_pose_target_groups == 0 &&
+        modes_.teleopModes().contains(request.control_mode))
+      {
+        modes_.selectTeleop(request.control_mode, false);
+      }
+      return;
+    }
     if (!isModeAvailable(request.control_mode)) {
       transition_id_ = request.transition_id;
       publishStatus(
@@ -447,6 +777,16 @@ private:
     }
     const ControlGroupMask preset_target = request.preset_target_groups;
     const ControlGroupMask initial_pose_target = request.initial_pose_target_groups;
+    if (
+      !leader_action_enabled_ &&
+      (request.enabled_groups != 0 || preset_target != 0 || initial_pose_target != 0))
+    {
+      transition_id_ = request.transition_id;
+      publishStatus(
+        ControlStatus::kHolding,
+        "Leader control request ignored: leader action output is disabled");
+      return;
+    }
     if (
       ((request.enabled_groups | preset_target | initial_pose_target) & ~allGroups()) != 0)
     {
@@ -472,7 +812,7 @@ private:
     const ControlGroupMask moving_initial_pose_groups =
       pose_sequences_->movingFinalInitialPoseGroups();
     const bool changing_mode =
-      mode_ready_ && request.control_mode != active_control_mode_;
+      modes_.ready() && request.control_mode != modes_.active();
     if (
       changing_mode &&
       (requested_groups_ != 0 || active_groups_ != 0 ||
@@ -493,16 +833,19 @@ private:
     }
     if (initial_pose_target != 0) {
       const ControlGroupMask available_groups =
-        mode_ready_ ? pose_sequences_->initialPoseGroups(active_control_mode_) : 0;
+        modes_.ready() ? pose_sequences_->initialPoseGroups(modes_.active()) : 0;
       if (
-        !mode_ready_ || transition_pending_ || mode_transition_started_ ||
-        request.control_mode != active_control_mode_ ||
+        !modes_.ready() || modes_.pending() || modes_.started() ||
+        request.control_mode != modes_.active() ||
         (initial_pose_target & available_groups) != initial_pose_target)
       {
         transition_id_ = request.transition_id;
         publishStatus(
           ControlStatus::kError,
-          "Initial pose trigger ignored because it is disabled for the active control mode");
+          (!modes_.ready() || modes_.pending() || modes_.started() ||
+          request.control_mode != modes_.active()) ?
+          "Initial pose request rejected: requested control mode is not ready" :
+          "Initial pose request rejected: no pose configured for the selected control group");
         return;
       }
       if (
@@ -534,21 +877,12 @@ private:
       return;
     }
 
-    transition_id_ = request.transition_id;
-    requested_control_mode_ = request.control_mode;
-    if (
-      mode_transition_started_ &&
-      transition_target_mode_ != requested_control_mode_)
-    {
-      if (mode_transition_phase_ != ModeTransitionPhase::kExitPose) {
-        pose_sequences_->cancelInitialPose();
-        pose_sequences_->cancelExitPose();
-        mode_transition_phase_ = ModeTransitionPhase::kIdle;
-        mode_transition_started_ = false;
-      } else {
-        transition_target_mode_ = requested_control_mode_;
-      }
+    if (action_input_) {
+      action_input_->clearGroups(request.enabled_groups ^ requested_groups_);
     }
+    transition_id_ = request.transition_id;
+    modes_.selectTeleop(request.control_mode, true);
+    modes_.retarget(*pose_sequences_);
     requested_groups_ = request.enabled_groups;
     requested_groups_ &= ~(preset_target | initial_pose_target);
     for (const auto & group : robot_teleoperation_->modeConfiguration().control_groups) {
@@ -559,9 +893,8 @@ private:
         selected_preset_ids_[group.id] = request.preset_ids[group.id];
       }
     }
-    transition_pending_ =
-      active_control_mode_ != requested_control_mode_ || !mode_ready_;
-    groups_pending_ = !transition_pending_;
+    modes_.setPending(modes_.active() != modes_.requested() || !modes_.ready());
+    groups_pending_ = !modes_.pending();
     if (preset_target != 0) {
       preset_update_pending_groups_ |= preset_target;
       preset_cancel_pending_groups_ &= ~preset_target;
@@ -575,13 +908,17 @@ private:
     if (resume_groups != 0) {
       final_initial_pose_cancel_pending_groups_ |= resume_groups;
     }
+    if (preset_target == 0 && initial_pose_target == 0) {
+      // Reference producers must observe the accepted request before a fresh pose
+      // can enable the group. Waiting for active_groups_ creates a resume deadlock.
+      publishStatus(active_groups_ == 0 ? ControlStatus::kHolding : ControlStatus::kActive,
+        "Control request accepted; waiting for reference/activation");
+    }
   }
 
   bool feedbackFresh() const
   {
-    return follower_received_ &&
-           (now() - last_follower_time_).seconds() <=
-           get_parameter("joint_state_timeout").as_double();
+    return feedback_.fresh(now(), get_parameter("joint_state_timeout").as_double());
   }
 
   ControlGroupMask allGroups() const
@@ -595,60 +932,79 @@ private:
 
   ControlGroupMask freshLeaderGroups() const
   {
-    const double timeout = get_parameter("leader_command_timeout").as_double();
-    ControlGroupMask result = 0;
-    for (const auto & group : robot_teleoperation_->modeConfiguration().control_groups) {
-      if (
-        group.id < leader_received_.size() && leader_received_[group.id] &&
-        (now() - last_leader_times_[group.id]).seconds() <= timeout)
-      {
-        result |= controlGroupBit(group.id);
-      }
-    }
-    return result;
+    if (teleopPoseMode() && action_input_) {return action_input_->freshGroups();}
+    return feedback_.freshLeaders(now(), get_parameter("leader_command_timeout").as_double(),
+      robot_teleoperation_->modeConfiguration());
+  }
+
+  bool teleopPoseMode() const
+  {
+    return source() == ControlSource::kTeleoperation && modes_.available(modes_.requested()) &&
+           modes_.teleopModes().at(modes_.requested()).reference_type == "absolute_eef_pose";
   }
 
   void initializeAuxiliaryCommands()
   {
-    auxiliary_command_ = robot_teleoperation_->followerAuxiliaryPosition();
-    auxiliary_hold_target_ = auxiliary_command_;
+    feedback_.initializeAuxiliary(*robot_teleoperation_);
   }
 
   void publishCommand(const Eigen::VectorXd & command, const ModeOutput * output = nullptr)
   {
+    if (!source_manager_->jointOutputAllowed()) {
+      return;
+    }
     const auto & leader_auxiliary = robot_teleoperation_->leaderAuxiliaryReference();
     for (const auto & group : robot_teleoperation_->modeConfiguration().control_groups) {
-      if (containsControlGroup(active_groups_, group.id)) {
-        auxiliary_command_[group.id] = leader_auxiliary[group.id];
+      const bool teleop_active = source() == ControlSource::kTeleoperation &&
+        containsControlGroup(active_groups_, group.id);
+      if ((source() == ControlSource::kModelAction || teleopPoseMode()) &&
+        action_input_->hasGripper(group.id) &&
+        (source() == ControlSource::kModelAction || teleop_active))
+      {
+        feedback_.auxiliary()[group.id] = leader_auxiliary[group.id];
+        feedback_.auxiliaryHold()[group.id] = feedback_.auxiliary()[group.id];
+      } else if (teleop_active) {
+        feedback_.auxiliary()[group.id] = leader_auxiliary[group.id];
       } else {
-        auxiliary_command_[group.id] = auxiliary_hold_target_[group.id];
+        feedback_.auxiliary()[group.id] = feedback_.auxiliaryHold()[group.id];
       }
     }
     if (output != nullptr) {
       for (const auto & target : output->auxiliary_position_targets) {
-        if (target.first >= auxiliary_command_.size()) {
+        if (target.first >= feedback_.auxiliary().size()) {
           continue;
         }
-        auto & command_target = auxiliary_command_[target.first];
+        auto & command_target = feedback_.auxiliary()[target.first];
         if (command_target.size() != target.second.size()) {
           continue;
         }
         for (Eigen::Index i = 0; i < target.second.size(); ++i) {
           if (std::isfinite(target.second[i])) {
             command_target[i] = target.second[i];
-            auxiliary_hold_target_[target.first][i] = target.second[i];
+            feedback_.auxiliaryHold()[target.first][i] = target.second[i];
           }
         }
       }
     }
-    robot_teleoperation_->publish(command, auxiliary_command_);
+    robot_teleoperation_->publish(command, feedback_.auxiliary());
+    if (source() == ControlSource::kTeleoperation) {
+      // Action pose is the desired EEF target. In model_action the external model
+      // owns that topic, including while an arm is held or its input has timed out.
+      static const std::vector<EefPoseReference> empty_references;
+      const ControlGroupMask publish_groups = !teleopPoseMode() || modes_.started() ?
+        allGroups() : pose_sequences_->activePresetGroups() |
+        pose_sequences_->activeFinalInitialPoseGroups();
+      robot_teleoperation_->publishEefPoseReferences(
+        command, output == nullptr ? empty_references : output->eef_pose_references,
+        publish_groups);
+    }
   }
 
   void captureAuxiliaryCommandAsHold(const ControlGroupMask groups)
   {
     for (const auto & group : robot_teleoperation_->modeConfiguration().control_groups) {
       if (containsControlGroup(groups, group.id)) {
-        auxiliary_hold_target_[group.id] = auxiliary_command_[group.id];
+        feedback_.auxiliaryHold()[group.id] = feedback_.auxiliary()[group.id];
       }
     }
   }
@@ -663,11 +1019,11 @@ private:
       context_group_states_[i].selected_preset_id = selected_preset_ids_[i];
     }
     return ModeContext{
-      command_position_,
-      command_velocity_,
+      feedback_.position(),
+      feedback_.velocity(),
       robot_teleoperation_->followerPosition(),
       robot_teleoperation_->leaderReference(),
-      robot_teleoperation_->leaderPosition(),
+      action_input_->cartesianReferences(),
       robot_teleoperation_->followerAuxiliaryPosition(),
       context_group_states_,
       requested_groups_,
@@ -676,7 +1032,8 @@ private:
       (pose_sequences_->activePresetGroups() |
       pose_sequences_->activeFinalInitialPoseGroups()) : 0,
       now().seconds(),
-      1.0 / std::max(1.0, get_parameter("control_frequency").as_double())};
+      1.0 / std::max(1.0, get_parameter("control_frequency").as_double()),
+      source() == ControlSource::kModelAction};
   }
 
   const std::vector<uint16_t> & selectedPresetIds() const
@@ -686,83 +1043,33 @@ private:
 
   void syncGroupCommandToFeedback(const ControlGroupMask groups)
   {
-    const auto & follower_auxiliary = robot_teleoperation_->followerAuxiliaryPosition();
-    for (const auto & group : robot_teleoperation_->modeConfiguration().control_groups) {
-      if (!containsControlGroup(groups, group.id)) {
-        continue;
-      }
-      for (const int index : group.follower_joint_indices) {
-        command_position_[index] = robot_teleoperation_->followerPosition()[index];
-        command_velocity_[index] = 0.0;
-      }
-      auxiliary_command_[group.id] = follower_auxiliary[group.id];
-    }
+    feedback_.syncGroups(groups, *robot_teleoperation_);
   }
 
   void captureGroupHoldTarget(const ControlGroupMask groups)
   {
-    const auto & follower_auxiliary = robot_teleoperation_->followerAuxiliaryPosition();
-    for (const auto & group : robot_teleoperation_->modeConfiguration().control_groups) {
-      if (!containsControlGroup(groups, group.id)) {
-        continue;
-      }
-      for (const int index : group.follower_joint_indices) {
-        hold_target_[index] = robot_teleoperation_->followerPosition()[index];
-      }
-      auxiliary_hold_target_[group.id] = follower_auxiliary[group.id];
-    }
+    feedback_.captureHold(groups, *robot_teleoperation_);
   }
 
-  void updateControlledGroupOwnership(const ControlGroupMask controlled_groups)
+  void updateControlledGroupOwnership(const ControlGroupMask groups)
   {
-    const ControlGroupMask released_groups =
-      previous_controlled_groups_ & ~controlled_groups;
-    if (released_groups != 0) {
-      captureGroupHoldTarget(released_groups);
-      syncGroupCommandToFeedback(released_groups);
-    }
-    previous_controlled_groups_ = controlled_groups;
+    feedback_.updateOwnership(groups, *robot_teleoperation_);
   }
 
   void syncCommandToFeedback()
   {
-    command_position_ = robot_teleoperation_->followerPosition();
-    command_velocity_ = Eigen::VectorXd::Zero(robot_teleoperation_->dof());
-    initializeAuxiliaryCommands();
-    command_initialized_ = true;
+    feedback_.resetCommand(*robot_teleoperation_);
   }
 
   bool startRequestedInitialPose()
   {
     try {
-      const ModeContext context = makeContext(0);
-      pose_sequences_->cancelExitPose();
-      if (pose_sequences_->hasInitialPose(transition_target_mode_)) {
-        if (!pose_sequences_->startInitialPose(transition_target_mode_, context)) {
-          throw std::runtime_error("initial pose transition was rejected");
-        }
-        const ControlGroupMask initial_pose_groups = pose_sequences_->activeInitialPoseGroups();
-        pose_sequences_->cancelPresets(initial_pose_groups);
-        paused_preset_groups_ &= ~initial_pose_groups;
-        mode_transition_phase_ = ModeTransitionPhase::kInitialPose;
-        publishStatus(
-          ControlStatus::kLoading,
-          "Moving to the initial pose for control mode " +
-          std::to_string(transition_target_mode_));
-      } else {
-        pose_sequences_->cancelInitialPose();
-        mode_transition_phase_ = ModeTransitionPhase::kActivate;
-      }
+      modes_.startInitial(*pose_sequences_, makeContext(0));
+      publishStatus(ControlStatus::kLoading, "Preparing requested mode initial pose");
       return true;
     } catch (const std::exception & error) {
-      pose_sequences_->cancelInitialPose();
-      pose_sequences_->cancelExitPose();
-      mode_transition_phase_ = ModeTransitionPhase::kIdle;
-      mode_transition_started_ = false;
-      transition_pending_ = false;
-      paused_preset_groups_ = 0;
-      publishStatus(
-        ControlStatus::kError,
+      modes_.cancelTransition(*pose_sequences_);
+      publishStatus(ControlStatus::kError,
         std::string("Failed to begin initial pose transition: ") + error.what());
       return false;
     }
@@ -770,62 +1077,23 @@ private:
 
   bool beginRequestedModeTransition()
   {
-    mode_transition_phase_ = ModeTransitionPhase::kIdle;
-    transition_target_mode_ = requested_control_mode_;
-    transition_source_mode_ = active_control_mode_;
-    paused_preset_groups_ = pose_sequences_->activePresetGroups();
+    if (action_input_) {action_input_->clear();}
     pose_sequences_->cancelFinalInitialPoses(allGroups());
     final_initial_pose_update_pending_groups_ = 0;
     final_initial_pose_cancel_pending_groups_ = 0;
-    publishStatus(
-      ControlStatus::kLoading,
-      "Loading control mode " + std::to_string(requested_control_mode_));
-    hold_target_ = robot_teleoperation_->followerPosition();
+    publishStatus(ControlStatus::kLoading,
+      "Loading control mode " + std::to_string(modes_.requested()));
+    feedback_.hold() = robot_teleoperation_->followerPosition();
     syncCommandToFeedback();
-    previous_controlled_groups_ = 0;
+    feedback_.resetOwnership();
     active_groups_ = 0;
-    publishCommand(hold_target_);
-    if (mode_) {
-      mode_->deactivate();
-      mode_.reset();
-    }
-    mode_ready_ = false;
-    active_control_mode_ = 0;
-
+    publishCommand(feedback_.hold());
     try {
-      const ModeContext context = makeContext(0);
-      const bool changing_mode =
-        transition_source_mode_ != 0 &&
-        transition_source_mode_ != transition_target_mode_;
-      if (changing_mode && pose_sequences_->hasExitPose(transition_source_mode_)) {
-        if (!pose_sequences_->startExitPose(transition_source_mode_, context)) {
-          throw std::runtime_error("exit pose transition was rejected");
-        }
-        const ControlGroupMask exit_pose_groups = pose_sequences_->activeExitPoseGroups();
-        pose_sequences_->cancelPresets(exit_pose_groups);
-        paused_preset_groups_ &= ~exit_pose_groups;
-        mode_transition_phase_ = ModeTransitionPhase::kExitPose;
-        publishStatus(
-          ControlStatus::kLoading,
-          "Moving to the exit pose for control mode " +
-          std::to_string(transition_source_mode_));
-      } else {
-        pose_sequences_->cancelExitPose();
-      }
-      mode_transition_started_ = true;
-      if (mode_transition_phase_ != ModeTransitionPhase::kExitPose) {
-        return startRequestedInitialPose();
-      }
+      modes_.beginTransition(*pose_sequences_, makeContext(0));
       return true;
     } catch (const std::exception & error) {
-      pose_sequences_->cancelInitialPose();
-      pose_sequences_->cancelExitPose();
-      mode_transition_phase_ = ModeTransitionPhase::kIdle;
-      mode_transition_started_ = false;
-      transition_pending_ = false;
-      paused_preset_groups_ = 0;
-      publishStatus(
-        ControlStatus::kError,
+      modes_.cancelTransition(*pose_sequences_);
+      publishStatus(ControlStatus::kError,
         std::string("Failed to begin mode transition: ") + error.what());
       return false;
     }
@@ -835,49 +1103,21 @@ private:
   {
     publishStatus(
       ControlStatus::kActivating,
-      "Activating control mode " + std::to_string(transition_target_mode_));
+      "Activating control mode " + std::to_string(modes_.target()));
     try {
-      mode_ =
-        mode_loader_.createSharedInstance(mode_plugins_.at(transition_target_mode_));
-      const std::string parameter_prefix =
-        "control_modes." + std::to_string(transition_target_mode_);
-      if (!mode_->configure(
-          *this, parameter_prefix, robot_teleoperation_->modeConfiguration()))
-      {
-        throw std::runtime_error("mode configuration was rejected");
-      }
+      modes_.configureTeleop(*this, robot_teleoperation_->modeConfiguration());
       robot_teleoperation_->followerKinematics()->updateState(
         robot_teleoperation_->followerPosition(), robot_teleoperation_->followerVelocity());
-      robot_teleoperation_->leaderKinematics()->updateState(
-        robot_teleoperation_->leaderPosition(),
-        Eigen::VectorXd::Zero(robot_teleoperation_->leaderPosition().size()));
       const ControlGroupMask initial_groups =
         requested_groups_ & freshLeaderGroups() &
         ~(pose_sequences_->movingPresetGroups() |
         pose_sequences_->movingFinalInitialPoseGroups());
       const ModeContext initial_context = makeContext(initial_groups);
-      if (!mode_->activate(initial_context)) {
-        throw std::runtime_error("mode activation was rejected");
-      }
-      if (
-        paused_preset_groups_ != 0 &&
-        !pose_sequences_->startPreset(
-          paused_preset_groups_, selectedPresetIds(), initial_context))
-      {
-        throw std::runtime_error("preset overlay reactivation was rejected");
-      }
-      active_control_mode_ = transition_target_mode_;
+      modes_.activateTeleop(initial_context, *pose_sequences_, selectedPresetIds());
       active_groups_ = initial_groups;
-      mode_ready_ = true;
-      transition_pending_ = false;
-      mode_transition_phase_ = ModeTransitionPhase::kIdle;
-      mode_transition_started_ = false;
-      paused_preset_groups_ = 0;
-      pose_sequences_->cancelInitialPose();
-      pose_sequences_->cancelExitPose();
       groups_pending_ = requested_groups_ != active_groups_;
       const bool mode_has_output =
-        (mode_->controlledGroups(initial_context) |
+        (modes_.plugin()->controlledGroups(initial_context) |
         pose_sequences_->activePresetGroups() |
         pose_sequences_->activeFinalInitialPoseGroups()) != 0;
       publishStatus(
@@ -886,19 +1126,13 @@ private:
         ControlStatus::kActive,
         active_groups_ == requested_groups_ ?
         "Mode activated" : "Mode activated; waiting for fresh leader reference");
+      RCLCPP_INFO(get_logger(), "Teleop mode %u ready", modes_.active());
       return true;
     } catch (const std::exception & error) {
-      mode_.reset();
-      pose_sequences_->cancelInitialPose();
-      pose_sequences_->cancelExitPose();
-      mode_ready_ = false;
-      active_control_mode_ = 0;
+      modes_.deactivate();
+      modes_.cancelTransition(*pose_sequences_);
       active_groups_ = 0;
-      previous_controlled_groups_ = 0;
-      transition_pending_ = false;
-      mode_transition_phase_ = ModeTransitionPhase::kIdle;
-      mode_transition_started_ = false;
-      paused_preset_groups_ = 0;
+      feedback_.resetOwnership();
       publishStatus(
         ControlStatus::kError,
         std::string("Failed to load mode: ") + error.what());
@@ -924,10 +1158,10 @@ private:
     syncGroupCommandToFeedback(disabled | enabled);
 
     active_groups_ = desired;
-    if (enabled != 0 && mode_) {
+    if (enabled != 0 && modes_.plugin()) {
       pose_sequences_->cancelPresets(enabled);
       pose_sequences_->cancelFinalInitialPoses(enabled);
-      mode_->onGroupsEnabled(enabled, makeContext(active_groups_));
+      modes_.plugin()->onGroupsEnabled(enabled, makeContext(active_groups_));
     }
     groups_pending_ = requested_groups_ != active_groups_;
     publishStatus(
@@ -946,7 +1180,7 @@ private:
     const ModeContext context = makeContext(0);
     try {
       robot_teleoperation_->followerKinematics()->updateState(
-        command_position_, command_velocity_);
+        feedback_.position(), feedback_.velocity());
 
       ModeOutput output;
       output.reset(
@@ -963,39 +1197,35 @@ private:
         pose_sequences_->activeExitPoseGroups() :
         pose_sequences_->activeInitialPoseGroups();
       applySoftHold(
-        output, command_position_, hold_target_,
+        output, feedback_.position(), feedback_.hold(),
         robot_teleoperation_->modeConfiguration().control_groups,
         controlled_groups,
         get_parameter("hold.kp").as_double(),
         get_parameter("hold.max_correction_velocity").as_double(),
         get_parameter("hold.tracking_weight").as_double());
 
-      qp_->setModeOutput(output);
-      qp_->setControllerParameters(
-        get_parameter("constraints.slack_penalty").as_double(),
-        get_parameter("constraints.cbf_alpha").as_double(),
-        get_parameter("constraints.collision_buffer").as_double(),
-        get_parameter("constraints.collision_safe_distance").as_double());
-      Eigen::VectorXd optimal_velocity;
-      if (!qp_->solve(optimal_velocity)) {
-        command_velocity_.setZero();
-        publishCommand(command_position_);
+      if (!runtime_->step(output, context.dt, feedback_.position(), feedback_.velocity())) {
+        feedback_.velocity().setZero();
+        publishCommand(feedback_.position(), &output);
+        pose_qp_failed_for_log_ = true;
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 1000,
           "%s pose QP failed; holding the last command and retrying",
           exit_pose ? "Exit" : "Initial");
         return true;
       }
-      command_position_ += context.dt * optimal_velocity;
-      command_velocity_ = optimal_velocity;
-      publishCommand(command_position_, &output);
+      if (pose_qp_failed_for_log_) {
+        pose_qp_failed_for_log_ = false;
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000, "Pose QP recovered");
+      }
+      publishCommand(feedback_.position(), &output);
       const bool moving = exit_pose ?
         pose_sequences_->exitPoseMoving() :
         pose_sequences_->initialPoseMoving();
       if (!moving) {
-        hold_target_ = command_position_;
+        feedback_.hold() = feedback_.position();
         captureAuxiliaryCommandAsHold(controlled_groups);
-        command_velocity_.setZero();
+        feedback_.velocity().setZero();
         publishStatus(
           ControlStatus::kLoading,
           exit_pose ?
@@ -1004,76 +1234,108 @@ private:
       }
       return true;
     } catch (const std::exception & error) {
-      hold_target_ = robot_teleoperation_->followerPosition();
+      feedback_.hold() = robot_teleoperation_->followerPosition();
       syncCommandToFeedback();
-      pose_sequences_->cancelInitialPose();
-      pose_sequences_->cancelExitPose();
-      mode_transition_phase_ = ModeTransitionPhase::kIdle;
-      mode_transition_started_ = false;
-      transition_pending_ = false;
-      paused_preset_groups_ = 0;
+      modes_.cancelTransition(*pose_sequences_);
       publishStatus(
         ControlStatus::kError,
         std::string(exit_pose ? "Exit" : "Initial") +
         " pose transition failed: " + error.what());
-      publishCommand(hold_target_);
+      publishCommand(feedback_.hold());
       return false;
     }
   }
 
   void controlLoop()
   {
+    if (!source_manager_->ready()) {return;}
     if (!feedbackFresh()) {
-      if (follower_received_ && !feedback_error_reported_) {
-        feedback_error_reported_ = true;
-        hold_target_ = robot_teleoperation_->followerPosition();
-        command_initialized_ = false;
+      if (feedback_.expire(*robot_teleoperation_)) {
         active_groups_ = 0;
-        previous_controlled_groups_ = 0;
+        if (action_input_) {action_input_->clear();}
+        if (source() == ControlSource::kModelAction && source_manager_->modelGranted()) {
+          // Suspend Cyclo output/observations; direct external commands bypass this node.
+          // Recovery must never inject a hold or replay an old direct command.
+          source_manager_->suspendModelOutput();
+          modes_.invalidate();
+        }
         publishStatus(
           ControlStatus::kError,
-          "Follower feedback timed out; holding all control groups");
+          "Follower feedback timed out; Cyclo joint output suspended");
       }
       return;
     }
-    feedback_error_reported_ = false;
-    if (!command_initialized_) {
-      hold_target_ = robot_teleoperation_->followerPosition();
+    feedback_.clearError();
+    if (!feedback_.commandInitialized()) {
+      feedback_.hold() = robot_teleoperation_->followerPosition();
       syncCommandToFeedback();
       pose_sequences_->rebaseActiveSequences(makeContext(0));
     }
+    feedback_.syncObservedJoints(*robot_teleoperation_);
+    if (source_manager_->exitPending()) {
+      if (!updateModePoseTransition(true)) {
+        failSourceSwitch("Exit pose could not be completed");
+      } else if (!pose_sequences_->exitPoseMoving()) {
+        const auto target = source_manager_->finishExit();
+        try {
+          switchSource(target);
+        } catch (const std::exception & error) {
+          failSourceSwitch(error.what());
+        }
+      }
+      return;
+    }
+    if (source() == ControlSource::kNone) {
+      return;
+    }
+    if (source() == ControlSource::kModelAction) {
+      updateModelAction();
+      if (source_manager_->transitioning()) {
+        if (modes_.ready() && source_manager_->modelGranted()) {
+          source_manager_->complete(source());
+        } else {
+          failSourceSwitch("Model action controller could not be activated");
+        }
+      }
+      return;
+    }
 
-    if (transition_pending_ && hold_initialized_) {
-      if (!mode_transition_started_ && !beginRequestedModeTransition()) {
-        publishCommand(hold_target_);
+    if (modes_.pending() && feedback_.holdInitialized()) {
+      if (!modes_.started() && !beginRequestedModeTransition()) {
+        publishCommand(feedback_.hold());
+        if (source_manager_->transitioning()) {failSourceSwitch("Initial pose setup failed");}
         return;
       }
-      if (mode_transition_phase_ == ModeTransitionPhase::kExitPose) {
+      if (modes_.phase() == ModeManager::Phase::kExitPose) {
         if (pose_sequences_->exitPoseMoving()) {
           updateModePoseTransition(true);
           return;
         }
         if (!startRequestedInitialPose()) {
-          publishCommand(hold_target_);
+          publishCommand(feedback_.hold());
+          if (source_manager_->transitioning()) {failSourceSwitch("Initial pose setup failed");}
           return;
         }
       }
       if (
-        mode_transition_phase_ == ModeTransitionPhase::kInitialPose &&
+        modes_.phase() == ModeManager::Phase::kInitialPose &&
         pose_sequences_->initialPoseMoving())
       {
-        updateModePoseTransition(false);
+        if (!updateModePoseTransition(false) && source_manager_->transitioning()) {
+          failSourceSwitch("Initial pose could not be completed");
+        }
         return;
       }
-      mode_transition_phase_ = ModeTransitionPhase::kActivate;
       if (!activateRequestedMode()) {
-        publishCommand(hold_target_);
+        publishCommand(feedback_.hold());
+        if (source_manager_->transitioning()) {failSourceSwitch("Teleop controller setup failed");}
         return;
       }
+      if (source_manager_->transitioning()) {source_manager_->complete(source());}
     }
-    if (!mode_ready_ || !mode_) {
-      if (hold_initialized_) {
-        publishCommand(hold_target_);
+    if (!modes_.ready() || !modes_.plugin()) {
+      if (feedback_.holdInitialized()) {
+        publishCommand(feedback_.hold());
       }
       return;
     }
@@ -1107,12 +1369,12 @@ private:
       syncGroupCommandToFeedback(update_groups);
       pose_sequences_->cancelPresets(update_groups);
       if (!pose_sequences_->startFinalInitialPose(
-          active_control_mode_, update_groups, makeContext(active_groups_)))
+          modes_.active(), update_groups, makeContext(active_groups_)))
       {
         publishStatus(
           ControlStatus::kError,
           pose_sequences_->errorMessage());
-        publishCommand(command_position_);
+        publishCommand(feedback_.position());
         return;
       }
       publishStatus(
@@ -1130,41 +1392,33 @@ private:
         publishStatus(
           ControlStatus::kError,
           "Preset update was rejected by the active mode");
-        publishCommand(command_position_);
+        publishCommand(feedback_.position());
         return;
       }
     }
 
-    const ControlGroupMask timed_command_sync_groups =
-      mode_->timedCommandFeedbackSyncGroups(makeContext(active_groups_));
-    if (timed_command_sync_groups != 0) {
-      syncGroupCommandToFeedback(timed_command_sync_groups);
-    }
     const ModeContext context = makeContext(active_groups_);
     const ControlGroupMask controlled_groups =
-      mode_->controlledGroups(context) |
+      modes_.plugin()->controlledGroups(context) |
       pose_sequences_->activePresetGroups() |
       pose_sequences_->activeFinalInitialPoseGroups();
     updateControlledGroupOwnership(controlled_groups);
     if (controlled_groups == 0) {
-      command_position_ = hold_target_;
-      command_velocity_.setZero();
-      publishCommand(hold_target_);
+      feedback_.position() = feedback_.hold();
+      feedback_.velocity().setZero();
+      publishCommand(feedback_.hold());
       return;
     }
 
     try {
       robot_teleoperation_->followerKinematics()->updateState(
-        command_position_, command_velocity_);
-      robot_teleoperation_->leaderKinematics()->updateState(
-        robot_teleoperation_->leaderPosition(),
-        Eigen::VectorXd::Zero(robot_teleoperation_->leaderPosition().size()));
+        feedback_.position(), feedback_.velocity());
 
       ModeOutput output;
       output.reset(
         robot_teleoperation_->dof(),
         get_parameter("constraints.damping_weight").as_double());
-      if (!mode_->update(context, output)) {
+      if (!modes_.plugin()->update(context, output)) {
         throw std::runtime_error("active mode rejected update");
       }
       if (!pose_sequences_->updatePresets(context, output)) {
@@ -1179,29 +1433,26 @@ private:
         get_parameter("hold.max_correction_velocity").as_double();
       const double hold_weight = get_parameter("hold.tracking_weight").as_double();
       applySoftHold(
-        output, command_position_, hold_target_,
+        output, feedback_.position(), feedback_.hold(),
         robot_teleoperation_->modeConfiguration().control_groups,
         controlled_groups, hold_kp, max_hold_velocity, hold_weight);
 
-      qp_->setModeOutput(output);
-      qp_->setControllerParameters(
-        get_parameter("constraints.slack_penalty").as_double(),
-        get_parameter("constraints.cbf_alpha").as_double(),
-        get_parameter("constraints.collision_buffer").as_double(),
-        get_parameter("constraints.collision_safe_distance").as_double());
-      Eigen::VectorXd optimal_velocity;
-      if (!qp_->solve(optimal_velocity)) {
-        command_velocity_.setZero();
-        publishCommand(command_position_);
+      if (!runtime_->step(output, context.dt, feedback_.position(), feedback_.velocity())) {
+        feedback_.velocity().setZero();
+        publishCommand(feedback_.position(), &output);
+        teleop_qp_failed_for_log_ = true;
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 1000,
           "Teleoperation QP failed; holding the last command and retrying");
         return;
       }
 
-      command_position_ += context.dt * optimal_velocity;
-      command_velocity_ = optimal_velocity;
-      publishCommand(command_position_, &output);
+      if (teleop_qp_failed_for_log_) {
+        teleop_qp_failed_for_log_ = false;
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000, "Teleoperation QP recovered");
+      }
+
+      publishCommand(feedback_.position(), &output);
 
       std::vector<uint8_t> preset_states(last_preset_states_.size(), 0);
       std::vector<uint8_t> initial_pose_states(last_initial_pose_states_.size(), 0);
@@ -1221,11 +1472,11 @@ private:
           "Pose sequence state updated");
       }
     } catch (const std::exception & error) {
-      hold_target_ = robot_teleoperation_->followerPosition();
+      feedback_.hold() = robot_teleoperation_->followerPosition();
       syncCommandToFeedback();
       active_groups_ = 0;
       requested_groups_ = 0;
-      previous_controlled_groups_ = 0;
+      feedback_.resetOwnership();
       pose_sequences_->cancelPresets(allGroups());
       pose_sequences_->cancelFinalInitialPoses(allGroups());
       preset_update_pending_groups_ = 0;
@@ -1235,19 +1486,29 @@ private:
       publishStatus(
         ControlStatus::kError,
         std::string("Control update failed; holding all control groups: ") + error.what());
-      publishCommand(hold_target_);
+      publishCommand(feedback_.hold());
     }
   }
 
   void publishStatus(const uint8_t state, const std::string & message)
   {
-    if (!robot_teleoperation_) {
+    // Deduplicate identical errors without hiding a different error shortly afterwards.
+    if (state != last_status_state_for_log_ || message != last_status_message_for_log_) {
+      if (state == ControlStatus::kError) {
+        RCLCPP_ERROR(get_logger(), "%s", controlLogMessage(message).c_str());
+      } else {
+        RCLCPP_DEBUG(get_logger(), "%s", controlLogMessage(message).c_str());
+      }
+      last_status_state_for_log_ = state;
+      last_status_message_for_log_ = message;
+    }
+    if (!robot_teleoperation_ || source() == ControlSource::kNone) {
       return;
     }
     ControlStatus status;
     status.transition_id = transition_id_;
-    status.requested_control_mode = requested_control_mode_;
-    status.active_control_mode = active_control_mode_;
+    status.requested_control_mode = modes_.requested();
+    status.active_control_mode = modes_.active();
     status.requested_groups = requested_groups_;
     status.active_groups = active_groups_;
     status.preset_ids = selected_preset_ids_;
@@ -1263,56 +1524,35 @@ private:
         pose_sequences_ ? pose_sequences_->finalInitialPoseState(group.id) : 0;
     }
     status.initial_pose_available_groups =
-      pose_sequences_ && mode_ready_ ?
-      pose_sequences_->initialPoseGroups(active_control_mode_) : 0;
+      pose_sequences_ && modes_.ready() ?
+      pose_sequences_->initialPoseGroups(modes_.active()) : 0;
     status.state = state;
     status.message = message;
     robot_teleoperation_->publishStatus(status);
   }
 
   pluginlib::ClassLoader<RobotTeleoperation> robot_loader_;
-  pluginlib::ClassLoader<TeleoperationMode> mode_loader_;
   std::shared_ptr<RobotTeleoperation> robot_teleoperation_;
-  std::shared_ptr<TeleoperationMode> mode_;
+  ModeManager modes_;
+  FeedbackState feedback_;
   std::unique_ptr<PoseSequenceManager> pose_sequences_;
-  std::unique_ptr<TeleoperationQP> qp_;
-
-  std::unordered_map<uint16_t, std::string> mode_names_;
-  std::unordered_map<uint16_t, std::string> mode_plugins_;
-  uint16_t requested_control_mode_ = 1;
-  uint16_t active_control_mode_ = 0;
-  uint16_t transition_target_mode_ = 0;
-  uint16_t transition_source_mode_ = 0;
+  std::unique_ptr<ControlRuntime> runtime_;
+  std::unique_ptr<ActionInput> action_input_;
+  std::unique_ptr<CommandSourceManager> source_manager_;
   std::vector<uint16_t> selected_preset_ids_;
   mutable std::vector<ControlGroupState> context_group_states_;
-  ControlGroupMask requested_groups_ = 0;
-  ControlGroupMask active_groups_ = 0;
-  ControlGroupMask previous_controlled_groups_ = 0;
-  uint64_t transition_id_ = 0;
-  bool transition_pending_ = false;
-  bool mode_transition_started_ = false;
-  ModeTransitionPhase mode_transition_phase_ = ModeTransitionPhase::kIdle;
-  bool groups_pending_ = false;
-  ControlGroupMask preset_update_pending_groups_ = 0;
-  ControlGroupMask preset_cancel_pending_groups_ = 0;
+  ControlGroupMask requested_groups_ = 0, active_groups_ = 0;
+  uint64_t transition_id_ = 0, next_transition_id_ = 0;
+  bool groups_pending_ = false, leader_action_enabled_ = false;
+  bool feedback_seen_for_log_ = false;
+  uint8_t last_status_state_for_log_ = 0;
+  std::string last_status_message_for_log_;
+  bool model_qp_failed_for_log_ = false, pose_qp_failed_for_log_ = false;
+  bool teleop_qp_failed_for_log_ = false;
+  ControlGroupMask preset_update_pending_groups_ = 0, preset_cancel_pending_groups_ = 0;
   ControlGroupMask final_initial_pose_update_pending_groups_ = 0;
   ControlGroupMask final_initial_pose_cancel_pending_groups_ = 0;
-  ControlGroupMask paused_preset_groups_ = 0;
-  bool mode_ready_ = false;
-  bool follower_received_ = false;
-  bool hold_initialized_ = false;
-  std::vector<bool> leader_received_;
-  bool feedback_error_reported_ = false;
-  bool command_initialized_ = false;
-  std::vector<uint8_t> last_preset_states_;
-  std::vector<uint8_t> last_initial_pose_states_;
-  Eigen::VectorXd hold_target_;
-  Eigen::VectorXd command_position_;
-  Eigen::VectorXd command_velocity_;
-  GroupAuxiliaryPositions auxiliary_hold_target_;
-  GroupAuxiliaryPositions auxiliary_command_;
-  rclcpp::Time last_follower_time_{0, 0, RCL_ROS_TIME};
-  std::vector<rclcpp::Time> last_leader_times_;
+  std::vector<uint8_t> last_preset_states_, last_initial_pose_states_;
 
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr follower_subscription_;
   std::vector<rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr>

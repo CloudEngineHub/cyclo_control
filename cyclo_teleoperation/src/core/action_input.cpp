@@ -1,0 +1,250 @@
+// Copyright 2026 ROBOTIS CO., LTD.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#include "cyclo_teleoperation/core/action_input.hpp"
+#include <algorithm>
+#include <cmath>
+#include <utility>
+#include <stdexcept>
+#include <unordered_set>
+
+namespace cyclo_teleoperation
+{
+ActionInput::ActionInput(
+  rclcpp::Node & node, RobotTeleoperation & robot,
+  std::function<bool()> enabled, std::function<std::string()> reference_type,
+  std::function<std::string()> anchor_frame)
+: node_(node), robot_(robot), enabled_(std::move(enabled)),
+  reference_type_(std::move(reference_type)), anchor_frame_(std::move(anchor_frame))
+{
+  frame_ = node.declare_parameter("model_action_reference_frame", "base_link");
+  timeout_ = node.declare_parameter("model_action_timeout", 0.5);
+  if (!std::isfinite(timeout_) || timeout_ <= 0.0) {
+    throw std::runtime_error("model_action_timeout must be finite and positive");
+  }
+  size_t size = 0;
+  for (const auto & group : robot.modeConfiguration().control_groups) {
+    size = std::max(size, static_cast<size_t>(group.id) + 1);
+  }
+  poses_.resize(size);
+  joint_received_.resize(size); pose_received_.resize(size); gripper_received_.resize(size);
+  joint_times_.assign(size, node.now()); pose_times_.assign(size, node.now());
+  joint_stamps_.assign(size, rclcpp::Time(0, 0, node.get_clock()->get_clock_type()));
+  pose_stamps_ = joint_stamps_;
+  const auto qos = rclcpp::QoS(1).reliable();
+  rclcpp::SubscriptionOptions external_input_options;
+  // The action channel is shared by leader reference generation and external nodes.
+  // Never consume our own teleop reference as a model action during source handoff.
+  external_input_options.ignore_local_publications = true;
+  for (const auto & group : robot.modeConfiguration().control_groups) {
+    const auto id = group.id;
+    const std::string prefix = "commands." + group.name;
+    const auto joint_topic = node.declare_parameter(
+      prefix + ".joint_topic", "/action/" + group.name + "/gripper");
+    const auto pose_topic = node.declare_parameter(
+      prefix + ".pose_topic", "/action/" + group.name + "/pose");
+    joints_.push_back(node.create_subscription<trajectory_msgs::msg::JointTrajectory>(
+      joint_topic, qos, [this, id](const trajectory_msgs::msg::JointTrajectory::SharedPtr msg) {
+          // Joint model mode is always direct; this channel is only gripper input for EEF.
+          if (!enabled_() || reference_type_() != "absolute_eef_pose") {return;}
+          rclcpp::Time stamp(0, 0, node_.get_clock()->get_clock_type());
+          if (!validStamp(msg->header.stamp, joint_stamps_[id], stamp)) {return;}
+          try {
+            if (!robot_.updateGripperReference(*msg, id)) {
+              RCLCPP_WARN_THROTTLE(node_.get_logger(), *node_.get_clock(), 2000,
+                "Gripper command ignored for group %u: missing or invalid joint data", id);
+              return;
+            }
+          } catch (const std::exception & error) {
+            RCLCPP_WARN_THROTTLE(node_.get_logger(), *node_.get_clock(), 2000,
+              "Invalid joint command ignored: %s", error.what());
+            return;
+          }
+          if (stamp.nanoseconds() != 0) {joint_stamps_[id] = stamp;}
+          gripper_received_[id] = true;
+      }));
+    pose_inputs_.push_back(node.create_subscription<geometry_msgs::msg::PoseStamped>(
+      pose_topic, qos, [this, id](const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
+          if (!enabled_() || reference_type_() != "absolute_eef_pose") {return;}
+          if (msg->header.frame_id != frame_) {
+            RCLCPP_WARN_THROTTLE(node_.get_logger(), *node_.get_clock(), 2000,
+              "Pose command ignored for group %u: frame '%s' must be '%s'",
+              id, msg->header.frame_id.c_str(), frame_.c_str());
+            return;
+          }
+          rclcpp::Time stamp(0, 0, node_.get_clock()->get_clock_type());
+          if (!validStamp(msg->header.stamp, pose_stamps_[id], stamp)) {return;}
+          const auto & p = msg->pose.position;
+          const auto & q = msg->pose.orientation;
+          Eigen::Vector3d position(p.x, p.y, p.z);
+          Eigen::Quaterniond rotation(q.w, q.x, q.y, q.z);
+          if (!position.allFinite() || !rotation.coeffs().allFinite() ||
+          !std::isfinite(rotation.norm()) || rotation.norm() < 1e-9)
+          {
+            RCLCPP_WARN_THROTTLE(node_.get_logger(), *node_.get_clock(), 2000,
+              "Pose command ignored for group %u: non-finite position or invalid quaternion", id);
+            return;
+          }
+          Eigen::Affine3d goal = Eigen::Affine3d::Identity();
+          goal.translation() = position;
+          goal.linear() = rotation.normalized().toRotationMatrix();
+          const auto anchor = anchor_frame_();
+          if (!anchor.empty()) {
+            // Teleop targets are published in base coordinates at the feedback stamp.
+            // Recover their arm-frame value using that same measured frame, not the
+            // latest lift height at callback arrival. External absolute goals stay fixed.
+            auto snapshot = frames_.rbegin();
+            while (snapshot != frames_.rend() && stamp.nanoseconds() != 0 &&
+            snapshot->stamp > stamp) {++snapshot;}
+            if (snapshot == frames_.rend() || snapshot->poses.count(anchor) == 0 ||
+            (stamp.nanoseconds() != 0 && (stamp - snapshot->stamp).seconds() > timeout_))
+            {
+              return;
+            }
+            goal = snapshot->poses.at(anchor).inverse() * goal;
+          }
+          poses_[id].pose = goal;
+          poses_[id].anchor_frame = anchor;
+          poses_[id].valid = true;
+          ++poses_[id].sequence;
+          pose_received_[id] = true;
+          pose_times_[id] = stamp.nanoseconds() == 0 ? node_.now() : stamp;
+          if (stamp.nanoseconds() != 0) {pose_stamps_[id] = stamp;}
+      }, external_input_options));
+  }
+  direct_channels_ = robot.followerCommandChannels();
+  std::unordered_set<ControlGroupId> direct_groups;
+  std::unordered_set<std::string> direct_topics;
+  for (const auto & channel : direct_channels_) {
+    const auto & groups = robot.modeConfiguration().control_groups;
+    if (channel.topic.empty() ||
+      std::none_of(groups.begin(), groups.end(), [&channel](const auto & group) {
+        return group.id == channel.group_id;
+      }) || !direct_groups.insert(channel.group_id).second ||
+      !direct_topics.insert(
+        node.get_node_topics_interface()->resolve_topic_name(channel.topic)).second)
+    {
+      throw std::runtime_error("Follower command channels must uniquely map each control group");
+    }
+    direct_inputs_.push_back(node.create_subscription<trajectory_msgs::msg::JointTrajectory>(
+      channel.topic, qos,
+        [this, id = channel.group_id](const trajectory_msgs::msg::JointTrajectory::SharedPtr msg) {
+          if (!enabled_() || reference_type_() != "absolute_joint_position") {return;}
+        // Observation only: the follower already receives this message directly. Validation
+        // here protects status/FK; it cannot reject a command on behalf of the follower.
+          rclcpp::Time stamp(0, 0, node_.get_clock()->get_clock_type());
+          if (!validStamp(msg->header.stamp, joint_stamps_[id], stamp)) {return;}
+          try {
+            if (!robot_.updateLeaderReference(*msg, id)) {
+              RCLCPP_WARN_THROTTLE(node_.get_logger(), *node_.get_clock(), 2000,
+                "Invalid direct joint input for group %u; Cyclo cannot block follower delivery",
+              id);
+              return;
+            }
+          } catch (const std::exception & error) {
+            RCLCPP_WARN_THROTTLE(node_.get_logger(), *node_.get_clock(), 2000,
+            "Invalid direct external command observation ignored: %s", error.what());
+            return;
+          }
+          joint_received_[id] = true;
+          gripper_received_[id] = true;
+          joint_times_[id] = stamp.nanoseconds() == 0 ? node_.now() : stamp;
+          if (stamp.nanoseconds() != 0) {joint_stamps_[id] = stamp;}
+      }, external_input_options));
+  }
+  if (direct_groups.size() != robot.modeConfiguration().control_groups.size()) {
+    throw std::runtime_error(
+        "Robot must expose a follower command channel for every control group");
+  }
+  clear();
+}
+
+bool ActionInput::validStamp(
+  const builtin_interfaces::msg::Time & message, const rclcpp::Time & previous,
+  rclcpp::Time & stamp) const
+{
+  if (message.sec < 0 || message.nanosec >= 1000000000u) {
+    RCLCPP_DEBUG_THROTTLE(node_.get_logger(), *node_.get_clock(), 2000,
+      "Command ignored by Cyclo: invalid timestamp");
+    return false;
+  }
+  stamp = rclcpp::Time(message, node_.get_clock()->get_clock_type());
+  // Zero means immediate, for compatibility with existing JointTrajectory publishers.
+  if (stamp.nanoseconds() == 0) {return true;}
+  const double age = (node_.now() - stamp).seconds();
+  const bool valid = stamp >= reset_time_ && stamp >= previous && age >= 0.0 && age <= timeout_;
+  if (!valid) {
+    RCLCPP_DEBUG_THROTTLE(node_.get_logger(), *node_.get_clock(), 2000,
+      "Command ignored by Cyclo: stale, future, or out-of-order timestamp (age=%.3f s)", age);
+  }
+  return valid;
+}
+
+void ActionInput::clear()
+{
+  std::fill(joint_received_.begin(), joint_received_.end(), false);
+  std::fill(pose_received_.begin(), pose_received_.end(), false);
+  std::fill(gripper_received_.begin(), gripper_received_.end(), false);
+  for (auto & pose : poses_) {
+    pose.valid = false;
+  }
+  reset_time_ = node_.now();
+  std::fill(joint_stamps_.begin(), joint_stamps_.end(), reset_time_);
+  std::fill(pose_stamps_.begin(), pose_stamps_.end(), reset_time_);
+}
+
+void ActionInput::clearGroups(const ControlGroupMask groups)
+{
+  for (const auto & group : robot_.modeConfiguration().control_groups) {
+    if (!containsControlGroup(groups, group.id)) {continue;}
+    poses_[group.id].valid = false;
+    pose_received_[group.id] = false;
+    gripper_received_[group.id] = false;
+    pose_stamps_[group.id] = node_.now();
+  }
+}
+
+void ActionInput::observeFrames(const std_msgs::msg::Header & header)
+{
+  const auto stamp = rclcpp::Time(header.stamp, node_.get_clock()->get_clock_type());
+  FrameSnapshot snapshot{stamp.nanoseconds() == 0 ? node_.now() : stamp, {}};
+  for (const auto & group : robot_.modeConfiguration().control_groups) {
+    if (!group.follower_control_frame.empty()) {
+      snapshot.poses.emplace(group.follower_control_frame,
+        robot_.followerKinematics()->computePose(
+          robot_.followerPosition(), group.follower_control_frame));
+    }
+  }
+  if (!frames_.empty() && snapshot.stamp < frames_.back().stamp) {frames_.clear();}
+  frames_.push_back(std::move(snapshot));
+  while (frames_.size() > 1 &&
+    (frames_.back().stamp - frames_.front().stamp).seconds() > 2.0 * timeout_)
+  {
+    frames_.pop_front();
+  }
+}
+
+ControlGroupMask ActionInput::freshGroups() const
+{
+  const bool pose = reference_type_() == "absolute_eef_pose";
+  ControlGroupMask result = 0;
+  for (const auto & group : robot_.modeConfiguration().control_groups) {
+    const auto id = group.id;
+    const double age = (node_.now() - (pose ? pose_times_[id] : joint_times_[id])).seconds();
+    if ((pose ? pose_received_[id] : joint_received_[id]) && age >= 0.0 && age <= timeout_) {
+      result |= controlGroupBit(id);
+    }
+  }
+  return result;
+}
+}  // namespace cyclo_teleoperation

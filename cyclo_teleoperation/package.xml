@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>cyclo_teleoperation</name>
-  <version>0.4.1</version>
+  <version>0.5.0</version>
   <description>Runtime-selectable teleoperation controllers for Cyclo follower robots.</description>
   <maintainer email="pyo@robotis.com">Pyo</maintainer>
   <license>Apache 2.0</license>
@@ -14,10 +14,13 @@
 
   <depend>cyclo_motion_controller_core</depend>
   <depend>eigen3_cmake_module</depend>
+  <depend>geometry_msgs</depend>
   <depend>pluginlib</depend>
   <depend>rclcpp</depend>
   <depend>robotis_interfaces</depend>
   <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
   <depend>trajectory_msgs</depend>
 
   <export>
