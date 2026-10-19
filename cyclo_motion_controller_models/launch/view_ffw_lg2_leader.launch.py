@@ -41,6 +41,7 @@ def generate_launch_description():
         pkg_share,
         'models',
         'ai_worker',
+        'leader',
         'ffw_lg2_leader.urdf',
     )
     rviz_config_file = os.path.join(pkg_share, 'rviz', 'ffw_lg2_leader.rviz')

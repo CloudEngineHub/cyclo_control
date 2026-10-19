@@ -1,0 +1,130 @@
+<?xml version="1.0"?>
+<robot name="ffw_bh5_follower">
+  <group name="arm_l">
+    <joint name="arm_l_joint1" />
+    <joint name="arm_l_joint2" />
+    <joint name="arm_l_joint3" />
+    <joint name="arm_l_joint4" />
+    <joint name="arm_l_joint5" />
+    <joint name="arm_l_joint6" />
+    <joint name="arm_l_joint7" />
+    <joint name="hx5_d20_left_joint" />
+  </group>
+  <group name="arm_r">
+    <joint name="arm_r_joint1" />
+    <joint name="arm_r_joint2" />
+    <joint name="arm_r_joint3" />
+    <joint name="arm_r_joint4" />
+    <joint name="arm_r_joint5" />
+    <joint name="arm_r_joint6" />
+    <joint name="arm_r_joint7" />
+    <joint name="hx5_d20_right_joint" />
+  </group>
+  <group name="head">
+        </group>
+  <group name="lift">
+    <joint name="lift_joint" />
+  </group>
+  <end_effector name="end_effector_l" parent_link="hx5_d20_left_base" group="arm_l" />
+  <end_effector name="end_effector_r" parent_link="hx5_d20_right_base" group="arm_r" />
+  <group_state name="init" group="arm_l">
+    <joint name="arm_l_joint1" value="0" />
+    <joint name="arm_l_joint2" value="0" />
+    <joint name="arm_l_joint3" value="0" />
+    <joint name="arm_l_joint4" value="0" />
+    <joint name="arm_l_joint5" value="0" />
+    <joint name="arm_l_joint6" value="0" />
+    <joint name="arm_l_joint7" value="0" />
+  </group_state>
+  <group_state name="init" group="arm_r">
+    <joint name="arm_r_joint1" value="0" />
+    <joint name="arm_r_joint2" value="0" />
+    <joint name="arm_r_joint3" value="0" />
+    <joint name="arm_r_joint4" value="0" />
+    <joint name="arm_r_joint5" value="0" />
+    <joint name="arm_r_joint6" value="0" />
+    <joint name="arm_r_joint7" value="0" />
+  </group_state>
+  <group_state name="init" group="head">
+        </group_state>
+  <group_state name="init" group="lift">
+    <joint name="lift_joint" value="0" />
+  </group_state>
+  <disable_collisions link1="arm_base_link" link2="arm_l_link1" reason="Adjacent" />
+  <disable_collisions link1="arm_base_link" link2="arm_l_link2" reason="Never" />
+  <disable_collisions link1="arm_base_link" link2="arm_l_link3" reason="Never" />
+  <disable_collisions link1="arm_base_link" link2="arm_r_link1" reason="Adjacent" />
+  <disable_collisions link1="arm_base_link" link2="arm_r_link2" reason="Never" />
+  <disable_collisions link1="arm_base_link" link2="arm_r_link3" reason="Never" />
+  <disable_collisions link1="arm_l_link1" link2="arm_l_link2" reason="Adjacent" />
+  <disable_collisions link1="arm_l_link1" link2="arm_l_link3" reason="Never" />
+  <disable_collisions link1="arm_l_link1" link2="arm_l_link4" reason="Never" />
+  <disable_collisions link1="arm_l_link1" link2="arm_l_link5" reason="Never" />
+  <disable_collisions link1="arm_l_link1" link2="arm_r_link1" reason="Never" />
+  <disable_collisions link1="arm_l_link1" link2="arm_r_link2" reason="Never" />
+  <disable_collisions link1="arm_l_link1" link2="arm_r_link3" reason="Never" />
+  <disable_collisions link1="arm_l_link1" link2="arm_r_link4" reason="Never" />
+  <disable_collisions link1="arm_l_link1" link2="arm_r_link5" reason="Never" />
+  <disable_collisions link1="arm_l_link1" link2="arm_r_link6" reason="Never" />
+  <disable_collisions link1="arm_l_link1" link2="arm_r_link7" reason="Never" />
+  <disable_collisions link1="arm_l_link2" link2="arm_l_link3" reason="Adjacent" />
+  <disable_collisions link1="arm_l_link2" link2="arm_l_link4" reason="Never" />
+  <disable_collisions link1="arm_l_link2" link2="arm_r_link1" reason="Never" />
+  <disable_collisions link1="arm_l_link2" link2="arm_r_link2" reason="Never" />
+  <disable_collisions link1="arm_l_link2" link2="arm_r_link3" reason="Never" />
+  <disable_collisions link1="arm_l_link2" link2="arm_r_link4" reason="Never" />
+  <disable_collisions link1="arm_l_link2" link2="arm_r_link5" reason="Never" />
+  <disable_collisions link1="arm_l_link2" link2="arm_r_link6" reason="Never" />
+  <disable_collisions link1="arm_l_link2" link2="arm_r_link7" reason="Never" />
+  <disable_collisions link1="arm_l_link3" link2="arm_l_link4" reason="Adjacent" />
+  <disable_collisions link1="arm_l_link3" link2="arm_l_link5" reason="Never" />
+  <disable_collisions link1="arm_l_link3" link2="arm_l_link6" reason="Never" />
+  <disable_collisions link1="arm_l_link3" link2="arm_l_link7" reason="Never" />
+  <disable_collisions link1="arm_l_link3" link2="arm_r_link1" reason="Never" />
+  <disable_collisions link1="arm_l_link3" link2="arm_r_link2" reason="Never" />
+  <disable_collisions link1="arm_l_link3" link2="arm_r_link3" reason="Never" />
+  <disable_collisions link1="arm_l_link3" link2="arm_r_link4" reason="Never" />
+  <disable_collisions link1="arm_l_link3" link2="arm_r_link5" reason="Never" />
+  <disable_collisions link1="arm_l_link3" link2="arm_r_link6" reason="Never" />
+  <disable_collisions link1="arm_l_link3" link2="arm_r_link7" reason="Never" />
+  <disable_collisions link1="arm_l_link4" link2="arm_l_link5" reason="Adjacent" />
+  <disable_collisions link1="arm_l_link4" link2="arm_l_link6" reason="Never" />
+  <disable_collisions link1="arm_l_link4" link2="arm_l_link7" reason="Never" />
+  <disable_collisions link1="arm_l_link4" link2="arm_r_link1" reason="Never" />
+  <disable_collisions link1="arm_l_link4" link2="arm_r_link2" reason="Never" />
+  <disable_collisions link1="arm_l_link4" link2="arm_r_link3" reason="Never" />
+  <disable_collisions link1="arm_l_link4" link2="arm_r_link4" reason="Never" />
+  <disable_collisions link1="arm_l_link4" link2="arm_r_link5" reason="Never" />
+  <disable_collisions link1="arm_l_link4" link2="arm_r_link6" reason="Never" />
+  <disable_collisions link1="arm_l_link5" link2="arm_l_link6" reason="Adjacent" />
+  <disable_collisions link1="arm_l_link5" link2="arm_l_link7" reason="Never" />
+  <disable_collisions link1="arm_l_link5" link2="arm_r_link1" reason="Never" />
+  <disable_collisions link1="arm_l_link5" link2="arm_r_link2" reason="Never" />
+  <disable_collisions link1="arm_l_link5" link2="arm_r_link3" reason="Never" />
+  <disable_collisions link1="arm_l_link5" link2="arm_r_link4" reason="Never" />
+  <disable_collisions link1="arm_l_link6" link2="arm_l_link7" reason="Adjacent" />
+  <disable_collisions link1="arm_l_link6" link2="arm_r_link1" reason="Never" />
+  <disable_collisions link1="arm_l_link6" link2="arm_r_link2" reason="Never" />
+  <disable_collisions link1="arm_l_link6" link2="arm_r_link3" reason="Never" />
+  <disable_collisions link1="arm_l_link7" link2="arm_r_link2" reason="Never" />
+  <disable_collisions link1="arm_l_link7" link2="arm_r_link3" reason="Never" />
+  <disable_collisions link1="arm_r_link1" link2="arm_r_link2" reason="Adjacent" />
+  <disable_collisions link1="arm_r_link1" link2="arm_r_link3" reason="Never" />
+  <disable_collisions link1="arm_r_link1" link2="arm_r_link4" reason="Never" />
+  <disable_collisions link1="arm_r_link2" link2="arm_r_link3" reason="Adjacent" />
+  <disable_collisions link1="arm_r_link2" link2="arm_r_link4" reason="Never" />
+  <disable_collisions link1="arm_r_link3" link2="arm_r_link4" reason="Adjacent" />
+  <disable_collisions link1="arm_r_link3" link2="arm_r_link5" reason="Never" />
+  <disable_collisions link1="arm_r_link3" link2="arm_r_link6" reason="Never" />
+  <disable_collisions link1="arm_r_link3" link2="arm_r_link7" reason="Never" />
+  <disable_collisions link1="arm_r_link4" link2="arm_r_link5" reason="Adjacent" />
+  <disable_collisions link1="arm_r_link4" link2="arm_r_link6" reason="Never" />
+  <disable_collisions link1="arm_r_link4" link2="arm_r_link7" reason="Never" />
+  <disable_collisions link1="arm_r_link5" link2="arm_r_link6" reason="Adjacent" />
+  <disable_collisions link1="arm_r_link5" link2="arm_r_link7" reason="Never" />
+  <disable_collisions link1="arm_r_link6" link2="arm_r_link7" reason="Adjacent" />
+  <disable_collisions link1="hx5_d20_left_base" link2="arm_l_link6" reason="Adjacent" />
+  <disable_collisions link1="hx5_d20_left_base" link2="arm_l_link7" reason="Adjacent" />
+  <disable_collisions link1="hx5_d20_right_base" link2="arm_r_link6" reason="Adjacent" />
+  <disable_collisions link1="hx5_d20_right_base" link2="arm_r_link7" reason="Adjacent" />
+</robot>

@@ -105,7 +105,7 @@ private:
     const std::vector<std::string> & names,
     const Eigen::VectorXd & command,
     const std::string & gripper_name,
-    double gripper_position) const;
+    const Eigen::VectorXd & gripper_position) const;
   void publishFollowerEefPoses(const std_msgs::msg::Header & source_header);
 
   rclcpp::Node * node_ = nullptr;
@@ -134,6 +134,8 @@ private:
 
   std::string right_gripper_joint_;
   std::string left_gripper_joint_;
+  std::string right_leader_gripper_joint_;
+  std::string left_leader_gripper_joint_;
   std::string follower_base_frame_;
   std::string temporary_leader_urdf_path_;
   std::string active_srdf_path_;

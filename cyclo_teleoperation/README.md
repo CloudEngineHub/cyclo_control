@@ -73,9 +73,17 @@ modes also declare `reference_type: absolute_joint_position|absolute_eef_pose`.
 EEF inputs are `PoseStamped` in the configured reference frame (`base_link` by
 default), using reliable, volatile, KeepLast(1) QoS on the shared action topic.
 Gripper-only `JointTrajectory` input uses the same per-arm joint command
-topic in EEF mode. Cyclo's joint output contains the arm and gripper and uses
+topic in EEF mode. Cyclo's joint output contains the arm and configured gripper and uses
 `time_from_start=0`; interpolation happens inside the runtime. Direct model joint
 messages are not altered, including their timestamps, durations and points.
+
+For arm-only AI Worker followers, set `left_gripper_joint: ""` and
+`right_gripper_joint: ""`. The robot plugin then requires no follower gripper
+feedback and emits seven arm joints per side. Leader triggers remain optional
+inputs (`leader_left_gripper_joint` / `leader_right_gripper_joint`); they are not
+forwarded to a hand controller. Hands can be controlled independently on their
+existing hand trajectory topics. Arm presets contain only their seven positions.
+Keep the gripper names unchanged on SG2/BG2/F1/F2 to retain combined arm/gripper output.
 
 `/action/{left,right}/pose` always represents a desired EEF target, while
 `/state/{left,right}/pose` is computed from actual follower feedback. In teleop,
