@@ -14,32 +14,32 @@ The AI Worker example YAML uses these teleoperation mode IDs (IDs are configurab
 
 AI Worker selects follower profiles in `config/ffw_sg2_rev1_follower/`:
 
-- `ffw_sg2_teleoperation.yaml`: robot model, teleop modes, presets and initial/exit poses.
-- `ffw_sg2_model_action.yaml`: model-action topics and controller modes.
-- `ffw_sg2_controller_parameters.yaml`: controller and pose-sequence tuning.
+- `ffw_sg2_teleoperation.yaml`: the unified follower profile, including robot models,
+  joints and topics, common controller settings, teleop modes and their gains,
+  external control modes, arm presets, and initial/exit poses.
 
-A2 input/model settings remain in `config/ffw_a2_leader/ffw_a2_leader_reference.yaml`.
-All four parameter files target the `cyclo_teleoperation` ROS node. The SG2 hardware
-and Gazebo bringups declare this node directly, list its profiles, and resolve
+A2 input/model settings live in `config/ffw_a2_leader/ffw_a2_leader_input.yaml`.
+Only the leader bringup loads this file into the common Leader JTCB. Follower
+bringups load only their own `ffw_<model>_teleoperation.yaml`, declare the
+Cyclo node directly, and resolve
 `$(find-pkg-share ...)` model paths. Model paths are configured in YAML, not repeated
 as launch arguments. `launch_utils.py` only shares command routing and successful
 startup sequencing; it does not launch hidden nodes.
-Only SG2 rev1 is integrated at present; other follower bringups are unchanged.
+SG2 rev1, BG2 rev4, F1, F2, SH5 rev1 and BH5 rev1 hardware/Gazebo bringups are integrated.
 
 The follower bringup is the launch entry point. The intermediate
 `ffw_control.launch.py`, `ffw_teleoperation.launch.py`, and
 `ffw_follower_action_controller.launch.py` entry points have been removed.
 
 `cyclo_teleoperation_node` is the only executable. Both input paths are always available;
-there is no model-only startup option. Loading the leader calculation model does not
-require connected leader hardware or a running leader bringup.
+there is no model-only startup option. A follower starts without any leader model,
+leader configuration or leader process. Leader FK runs outside the follower runtime.
 
 ## Shared teleoperation / model_action runtime
 
-The SG2 and BG2 AI Worker follower bringups (including Gazebo) always start the
+The integrated AI Worker follower bringups (including Gazebo) always start the
 common runtime once, after controller activation and any initial-position actions.
-There is no `enable_control` argument or separate action node/topic mux. Other
-follower models retain their existing launches.
+There is no `enable_control` argument or separate action node/topic mux.
 
 ```bash
 ros2 launch ffw_bringup ffw_sg2_follower_ai.launch.py
@@ -57,19 +57,20 @@ joystick mode. Joystick motion output is disabled in `model_action` source.
 
 | Purpose | Topic / service |
 | --- | --- |
-| Raw hardware reference | `/reference/{left,right}/joint` |
+| Leader raw joint reference | `/leader/joint_trajectory_command_broadcaster_{left,right}/raw_joint_trajectory` |
 | Model absolute joint input / final follower command | `/leader/joint_trajectory_command_broadcaster_{left,right}/joint_trajectory` |
-| Desired EEF action (Cyclo output in teleop, model input in model_action) | `/action/{left,right}/pose` |
-| Gripper-only input in model EEF mode | `/command/{left,right}/joint` |
+| Desired follower EEF action (leader-generated in relative teleop, external input in model_action) | `/action/{left,right}/pose` |
+| Gripper-only EEF input | `/action/{left,right}/gripper` |
 | Measured EEF state | `/state/{left,right}/pose` |
 | Hardware joint state | `/joint_states` |
+| Leader hardware joint state | `/leader/joint_states` |
 | Selected source + heartbeat | `/source` (`std_msgs/msg/String`) |
 | Select source | `/set_source` (`std_srvs/srv/SetBool`: true=teleop) |
 | Toggle source | `/toggle_source` (`std_srvs/srv/Trigger`) |
 | Select mode of the active source | `/set_mode` (`robotis_interfaces/srv/SetControlMode`) |
 
-Modes are registered independently in `control_modes` and `model_action_modes`; model
-modes also declare `reference_type: absolute_joint_position|absolute_eef_pose`.
+Modes are registered independently in `control_modes` and `model_action_modes`;
+every mode declares `reference_type: absolute_joint_position|absolute_eef_pose`.
 EEF inputs are `PoseStamped` in the configured reference frame (`base_link` by
 default), using reliable, volatile, KeepLast(1) QoS on the shared action topic.
 Gripper-only `JointTrajectory` input uses the same per-arm joint command
@@ -86,9 +87,11 @@ existing hand trajectory topics. Arm presets contain only their seven positions.
 Keep the gripper names unchanged on SG2/BG2/F1/F2 to retain combined arm/gripper output.
 
 `/action/{left,right}/pose` always represents a desired EEF target, while
-`/state/{left,right}/pose` is computed from actual follower feedback. In teleop,
-Cyclo publishes the controller's explicit EEF target, or FK of its joint command
-when there is no explicit target. Both joint actions and EEF actions continue
+`/state/{left,right}/pose` is computed from actual follower feedback. In joint teleop,
+Cyclo publishes FK of its joint command. In relative EEF teleop, the common Leader
+JTCB captures per-arm leader/follower anchors and publishes an absolute EEF goal.
+Follower `AbsolutePoseMode` tracks this input, also used by external EEF control.
+Cyclo owns EEF publication during preset/initial/exit overlays. Both joint actions and EEF actions continue
 while arms are paused, representing the hold target; measured states continue
 while valid follower feedback is received. Publication requires source setup to
 complete and fresh feedback, not an enabled teleop arm.
@@ -99,11 +102,18 @@ direct joint mode Cyclo no longer publishes a derived FK action pose; measured
 EEF states remain available. Model pose subscriptions reject local publications,
 ignore inputs outside model EEF control and discard old references at handoff.
 The former `/command/{left,right}/pose` input is replaced by the shared action
-topic. The separate gripper-only joint input is unchanged.
+topic. Gripper-only input is `/action/{left,right}/gripper`.
 
 ### Lift and Cartesian frames
 
 AI Worker relative teleop targets are held internally relative to `arm_base_link`.
+The common leader broadcaster generates the reference using its calculation URDF.
+It publishes a base-frame pose stamped with the follower EEF feedback sample.
+The follower reconstructs the arm-relative target using the matching measured
+frame history and follows the current arm frame. No leader TF or URDF is transferred.
+The physical leader may keep wall time while the follower uses simulation time:
+input freshness uses reception time, and TF/sample age is compared within the
+follower's timestamp domain. A valid simulation `/clock` is still required by the follower.
 The measured lift position updates kinematics every cycle, but lift is not an
 arm QP command variable. In teleop, moving lift alone therefore does not make
 either arm counter-move to hold an old `base_link` height. Arm commands remain open-loop.
@@ -115,9 +125,9 @@ compensate to maintain the commanded EEF pose, subject to the configured QP
 constraints. External action messages remain publisher-owned and are not echoed
 or rewritten by Cyclo. Direct external joint commands are unchanged.
 
-Robot plugins select `follower_control_frame` for each control group; the common
-relative controller uses it without robot names or numeric mode IDs. An empty
-frame preserves root-frame relative tracking for other robot plugins. Leader
+Robot plugins select `follower_control_frame` for each control group. A teleop
+pose mode selects `pose_anchor_frame` from these frames, without robot names or
+numeric mode IDs in the common controller. An empty anchor preserves base-frame tracking. Leader
 deltas retain the shared base axes even when the control frame is rotated. Joints
 outside all control groups are observed from feedback and locked in the arm QP;
 disabled arms still use the existing soft hold.
@@ -127,7 +137,7 @@ they should not implement their own lift feedback or joint ownership handling.
 Only controllers with relative anchors use `followerControlFramePose()` to
 store/reconstruct those anchors. Absolute pose controllers keep absolute targets.
 
-Every `absolute_joint_position` mode is direct, regardless of its numeric ID. Do not
+Every external `absolute_joint_position` mode is direct, regardless of its numeric ID. Do not
 specify a `plugin` or controller tuning for that mode. No plugin or QP is instantiated,
 and Cyclo publishes no joint commands, including holds, while direct mode is active.
 The old `/action/{left,right}/joint` output layer is removed. Follower arm, head and
@@ -185,12 +195,15 @@ lifecycle; `ModeRegistry` resolves its YAML entries. `FeedbackState` owns feedba
 freshness, integrated command state and hold targets; it rebases commands only at
 explicit enable/recovery events, not every feedback callback.
 `PoseSequenceManager` retains preset/initial/exit interpolation, and `ControlRuntime`
-executes the shared QP. `ModelActionInput` validates EEF/gripper inputs and observes
+executes the shared QP. `ActionInput` validates EEF/gripper inputs and observes
 direct joint commands and their external receive times. These are ordinary classes,
 not additional ROS nodes.
 The robot plugin owns kinematics, ROS output and the existing
 `robotis_interfaces` bridge. Controller plugins only contribute `ModeOutput`;
 new plugins using the existing input types need no runtime or AI Worker C++ edits.
+Every mode declares `reference_type: absolute_joint_position|absolute_eef_pose`.
+Teleop pose modes additionally select `pose_anchor_frame: arm_base_link`; external
+EEF modes leave the goal fixed in the base frame. Numeric mode IDs have no special meaning.
 
 Teleoperation enable/disable independently selects `left`, `right`, or `both` arms. Preset motion is
 a common per-arm overlay, not a control mode. Requesting a preset disables
@@ -210,6 +223,7 @@ available_control_modes: [1, 2, 3]
 
 control_modes.3.name: movej_precise
 control_modes.3.plugin: cyclo_teleoperation/MoveJMode
+control_modes.3.reference_type: absolute_joint_position
 control_modes.3.kp_joint: 30.0
 control_modes.3.tracking_weight: 15.0
 ```
@@ -279,3 +293,26 @@ the common soft-hold objective.
 
 Only the selected mode plugin exists at runtime. The lightweight preset overlay
 is shared by every mode and remains per-arm across mode changes.
+
+## Use a different leader
+
+The common `LeaderJointTrajectoryCommandBroadcaster` owns the optional pose bridge;
+the A2 subclass adds no FK or relative-reference logic. Its input YAML configures
+`leader_urdf_path`, optional `leader_base_frame`, `leader_left_eef` / `leader_right_eef`,
+and `leader_left_model_joints` / `leader_right_model_joints`. Empty root/EEF settings
+use the URDF root and the follower's EEF naming convention respectively. Explicit
+joint mapping arrays map raw arm positions, in order, to joints in a differently
+named calculation URDF. All movable joints between the selected base and EEF must
+be supplied; incomplete mappings are rejected. Revolute, continuous and prismatic
+joints are supported. FK uses no collision geometry or QP.
+
+The exported `cyclo_teleoperation_leader_reference` target provides pure FK and
+relative-to-absolute pose math without ROS connections. The leader bridge handles
+ROS subscriptions, measured follower TF, mode metadata and per-arm anchors outside
+the ros2_control update thread. Only the leader loads a leader calculation URDF.
+F1/F2 may supply `input_reference_urdf_path` as a portable calculation-model hint;
+the follower never constructs or executes a leader model from it. The A2 input
+profile enables `leader_use_follower_reference_model` to preserve its existing
+follower-sized geometry for these models. Such FK uses the configured arm anchor
+as its root, so a non-arm joint such as lift is not treated as a leader input.
+Set this flag to false when supplying a different leader calculation URDF.

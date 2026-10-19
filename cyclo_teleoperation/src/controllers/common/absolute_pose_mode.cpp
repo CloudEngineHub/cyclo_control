@@ -88,12 +88,14 @@ bool AbsolutePoseMode::update(const ModeContext & context, ModeOutput & output)
       return false;
     }
     TaskObjective task;
-    output.eef_pose_references.push_back(
-      EefPoseReference{group.id, context.cartesian_references[group.id].pose});
+    const auto & reference = context.cartesian_references[group.id];
+    const Eigen::Affine3d goal = reference.anchor_frame.empty() ? reference.pose :
+      configuration_.follower_kinematics->getPose(reference.anchor_frame) * reference.pose;
+    output.eef_pose_references.push_back(EefPoseReference{group.id, goal});
     task.link_name = group.follower_eef;
     task.desired_velocity = desiredVelocity(
       configuration_.follower_kinematics->getPose(group.follower_eef),
-      context.cartesian_references[group.id].pose);
+      goal);
     task.weight.head<3>().setConstant(weight_position_);
     task.weight.tail<3>().setConstant(weight_orientation_);
     output.task_objectives.push_back(std::move(task));

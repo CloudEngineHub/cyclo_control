@@ -32,7 +32,7 @@ void ModeRegistry::configure(
     }
     ModeEntry entry;
     entry.parameter_prefix = prefix + "." + std::to_string(id);
-    if (model_action_inputs) {
+    {
       entry.reference_type = parameter(
         entry.parameter_prefix + ".reference_type", std::string{}).as_string();
       if (entry.reference_type != "absolute_joint_position" &&
@@ -40,6 +40,10 @@ void ModeRegistry::configure(
       {
         throw std::runtime_error(entry.parameter_prefix + ": unsupported reference_type");
       }
+    }
+    entry.direct_joint = model_action_inputs && entry.reference_type == "absolute_joint_position";
+    if (!model_action_inputs) {
+      parameter(entry.parameter_prefix + ".pose_anchor_frame", std::string{});
     }
     entry.plugin = parameter(entry.parameter_prefix + ".plugin", std::string{}).as_string();
     if (entry.directJoint()) {

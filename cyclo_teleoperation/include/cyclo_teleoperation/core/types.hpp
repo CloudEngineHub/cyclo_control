@@ -52,7 +52,6 @@ struct ControlGroupConfiguration
   std::string name;
   std::vector<int> follower_joint_indices;
   std::string follower_eef;
-  std::string leader_eef;
   struct AuxiliaryJoint
   {
     std::string joint_name;
@@ -68,6 +67,7 @@ using GroupAuxiliaryPositions = std::vector<Eigen::VectorXd>;
 struct CartesianReference
 {
   Eigen::Affine3d pose = Eigen::Affine3d::Identity();
+  std::string anchor_frame;
   uint64_t sequence = 0;
   bool valid = false;
 };
@@ -155,7 +155,6 @@ struct ModeContext
   const Eigen::VectorXd & follower_velocity;
   const Eigen::VectorXd & measured_follower_position;
   const Eigen::VectorXd & leader_reference;
-  const Eigen::VectorXd & leader_position;
   const GroupCartesianReferences & cartesian_references;
   const GroupAuxiliaryPositions & measured_auxiliary_position;
   const std::vector<ControlGroupState> & group_states;
@@ -174,7 +173,6 @@ struct ModeContext
 struct ModeConfiguration
 {
   std::shared_ptr<cyclo_motion_controller::kinematics::KinematicsSolver> follower_kinematics;
-  std::shared_ptr<cyclo_motion_controller::kinematics::KinematicsSolver> leader_kinematics;
   std::vector<ControlGroupConfiguration> control_groups;
 
   bool controlsJoint(const int index) const

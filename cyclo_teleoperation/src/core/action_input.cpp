@@ -11,7 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-#include "cyclo_teleoperation/core/model_action_input.hpp"
+#include "cyclo_teleoperation/core/action_input.hpp"
 #include <algorithm>
 #include <cmath>
 #include <utility>
@@ -20,11 +20,12 @@
 
 namespace cyclo_teleoperation
 {
-ModelActionInput::ModelActionInput(
+ActionInput::ActionInput(
   rclcpp::Node & node, RobotTeleoperation & robot,
-  std::function<bool()> enabled, std::function<std::string()> reference_type)
+  std::function<bool()> enabled, std::function<std::string()> reference_type,
+  std::function<std::string()> anchor_frame)
 : node_(node), robot_(robot), enabled_(std::move(enabled)),
-  reference_type_(std::move(reference_type))
+  reference_type_(std::move(reference_type)), anchor_frame_(std::move(anchor_frame))
 {
   frame_ = node.declare_parameter("model_action_reference_frame", "base_link");
   timeout_ = node.declare_parameter("model_action_timeout", 0.5);
@@ -42,14 +43,14 @@ ModelActionInput::ModelActionInput(
   pose_stamps_ = joint_stamps_;
   const auto qos = rclcpp::QoS(1).reliable();
   rclcpp::SubscriptionOptions external_input_options;
-  // The same action topic is produced locally during teleop and externally by the model.
+  // The action channel is shared by leader reference generation and external nodes.
   // Never consume our own teleop reference as a model action during source handoff.
   external_input_options.ignore_local_publications = true;
   for (const auto & group : robot.modeConfiguration().control_groups) {
     const auto id = group.id;
     const std::string prefix = "commands." + group.name;
     const auto joint_topic = node.declare_parameter(
-      prefix + ".joint_topic", "/command/" + group.name + "/joint");
+      prefix + ".joint_topic", "/action/" + group.name + "/gripper");
     const auto pose_topic = node.declare_parameter(
       prefix + ".pose_topic", "/action/" + group.name + "/pose");
     joints_.push_back(node.create_subscription<trajectory_msgs::msg::JointTrajectory>(
@@ -94,8 +95,26 @@ ModelActionInput::ModelActionInput(
               "Pose command ignored for group %u: non-finite position or invalid quaternion", id);
             return;
           }
-          poses_[id].pose.translation() = position;
-          poses_[id].pose.linear() = rotation.normalized().toRotationMatrix();
+          Eigen::Affine3d goal = Eigen::Affine3d::Identity();
+          goal.translation() = position;
+          goal.linear() = rotation.normalized().toRotationMatrix();
+          const auto anchor = anchor_frame_();
+          if (!anchor.empty()) {
+            // Teleop targets are published in base coordinates at the feedback stamp.
+            // Recover their arm-frame value using that same measured frame, not the
+            // latest lift height at callback arrival. External absolute goals stay fixed.
+            auto snapshot = frames_.rbegin();
+            while (snapshot != frames_.rend() && stamp.nanoseconds() != 0 &&
+            snapshot->stamp > stamp) {++snapshot;}
+            if (snapshot == frames_.rend() || snapshot->poses.count(anchor) == 0 ||
+            (stamp.nanoseconds() != 0 && (stamp - snapshot->stamp).seconds() > timeout_))
+            {
+              return;
+            }
+            goal = snapshot->poses.at(anchor).inverse() * goal;
+          }
+          poses_[id].pose = goal;
+          poses_[id].anchor_frame = anchor;
           poses_[id].valid = true;
           ++poses_[id].sequence;
           pose_received_[id] = true;
@@ -150,7 +169,7 @@ ModelActionInput::ModelActionInput(
   clear();
 }
 
-bool ModelActionInput::validStamp(
+bool ActionInput::validStamp(
   const builtin_interfaces::msg::Time & message, const rclcpp::Time & previous,
   rclcpp::Time & stamp) const
 {
@@ -171,7 +190,7 @@ bool ModelActionInput::validStamp(
   return valid;
 }
 
-void ModelActionInput::clear()
+void ActionInput::clear()
 {
   std::fill(joint_received_.begin(), joint_received_.end(), false);
   std::fill(pose_received_.begin(), pose_received_.end(), false);
@@ -184,7 +203,38 @@ void ModelActionInput::clear()
   std::fill(pose_stamps_.begin(), pose_stamps_.end(), reset_time_);
 }
 
-ControlGroupMask ModelActionInput::freshGroups() const
+void ActionInput::clearGroups(const ControlGroupMask groups)
+{
+  for (const auto & group : robot_.modeConfiguration().control_groups) {
+    if (!containsControlGroup(groups, group.id)) {continue;}
+    poses_[group.id].valid = false;
+    pose_received_[group.id] = false;
+    gripper_received_[group.id] = false;
+    pose_stamps_[group.id] = node_.now();
+  }
+}
+
+void ActionInput::observeFrames(const std_msgs::msg::Header & header)
+{
+  const auto stamp = rclcpp::Time(header.stamp, node_.get_clock()->get_clock_type());
+  FrameSnapshot snapshot{stamp.nanoseconds() == 0 ? node_.now() : stamp, {}};
+  for (const auto & group : robot_.modeConfiguration().control_groups) {
+    if (!group.follower_control_frame.empty()) {
+      snapshot.poses.emplace(group.follower_control_frame,
+        robot_.followerKinematics()->computePose(
+          robot_.followerPosition(), group.follower_control_frame));
+    }
+  }
+  if (!frames_.empty() && snapshot.stamp < frames_.back().stamp) {frames_.clear();}
+  frames_.push_back(std::move(snapshot));
+  while (frames_.size() > 1 &&
+    (frames_.back().stamp - frames_.front().stamp).seconds() > 2.0 * timeout_)
+  {
+    frames_.pop_front();
+  }
+}
+
+ControlGroupMask ActionInput::freshGroups() const
 {
   const bool pose = reference_type_() == "absolute_eef_pose";
   ControlGroupMask result = 0;

@@ -39,12 +39,19 @@ add_library(cyclo_teleoperation_runtime SHARED
   src/core/fixed_duration_slow_start.cpp
   src/core/joint_trajectory_interpolator.cpp
 )
+
+add_library(cyclo_teleoperation_leader_reference SHARED
+  src/core/leader_pose_reference.cpp
+)
+target_link_libraries(cyclo_teleoperation_leader_reference PUBLIC
+  cyclo_teleoperation_interfaces
+)
 target_include_directories(cyclo_teleoperation_runtime PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
 target_link_libraries(cyclo_teleoperation_runtime PUBLIC
-  cyclo_teleoperation_interfaces
+    cyclo_teleoperation_interfaces
 )
 
 add_library(cyclo_teleoperation_qp SHARED
@@ -63,7 +70,6 @@ target_link_libraries(cyclo_teleoperation_qp PUBLIC
 add_library(cyclo_teleoperation_common_controller_plugins SHARED
   src/controllers/common/absolute_pose_mode.cpp
   src/controllers/common/movej_mode.cpp
-  src/controllers/common/relative_pose_mode.cpp
 )
 target_include_directories(cyclo_teleoperation_common_controller_plugins PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -92,7 +98,7 @@ ament_target_dependencies(cyclo_teleoperation_ai_worker_robot_plugin
   geometry_msgs pluginlib rclcpp robotis_interfaces sensor_msgs trajectory_msgs)
 
 add_library(cyclo_teleoperation_node_runtime SHARED
-  src/core/model_action_input.cpp
+  src/core/action_input.cpp
   src/core/mode_registry.cpp
   src/core/mode_manager.cpp
   src/core/feedback_state.cpp
@@ -126,6 +132,7 @@ pluginlib_export_plugin_description_file(
 
 install(TARGETS
   cyclo_teleoperation_interfaces
+  cyclo_teleoperation_leader_reference
   cyclo_teleoperation_qp
   cyclo_teleoperation_runtime
   EXPORT cyclo_teleoperationTargets

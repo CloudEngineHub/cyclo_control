@@ -53,7 +53,6 @@ public:
   virtual const Eigen::VectorXd & followerPosition() const = 0;
   virtual const Eigen::VectorXd & followerVelocity() const = 0;
   virtual const Eigen::VectorXd & leaderReference() const = 0;
-  virtual const Eigen::VectorXd & leaderPosition() const = 0;
   virtual const GroupAuxiliaryPositions & followerAuxiliaryPosition() const = 0;
   virtual const GroupAuxiliaryPositions & leaderAuxiliaryReference() const = 0;
   virtual const std::vector<ControlGroupState> & controlGroupStates() const = 0;
@@ -61,8 +60,6 @@ public:
   virtual const ModeConfiguration & modeConfiguration() const = 0;
   virtual std::shared_ptr<cyclo_motion_controller::kinematics::KinematicsSolver>
   followerKinematics() const = 0;
-  virtual std::shared_ptr<cyclo_motion_controller::kinematics::KinematicsSolver>
-  leaderKinematics() const = 0;
 
   virtual std::string followerJointStatesTopic() const = 0;
   virtual const std::vector<JointTrajectoryChannel> & leaderInputChannels() const = 0;
@@ -82,7 +79,7 @@ public:
     const GroupAuxiliaryPositions & auxiliary_command) = 0;
   virtual void publishEefPoseReferences(
     const Eigen::VectorXd &,
-    const std::vector<EefPoseReference> &) {}
+    const std::vector<EefPoseReference> &, ControlGroupMask) {}
   // State ingestion must not publish. The runtime owns output scheduling and source selection.
   virtual void publishFollowerEefState(const std_msgs::msg::Header &) {}
   virtual bool selectControlSource(const std::string &) {return true;}

@@ -26,7 +26,8 @@ struct ModeEntry
   std::string plugin;
   std::string parameter_prefix;
   std::string reference_type;
-  bool directJoint() const {return reference_type == "absolute_joint_position";}
+  bool direct_joint = false;
+  bool directJoint() const {return direct_joint;}
 };
 
 class ModeRegistry
