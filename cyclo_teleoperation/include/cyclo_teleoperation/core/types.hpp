@@ -17,6 +17,7 @@
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -51,16 +52,27 @@ struct ControlGroupConfiguration
   std::string name;
   std::vector<int> follower_joint_indices;
   std::string follower_eef;
-  std::string leader_eef;
   struct AuxiliaryJoint
   {
     std::string joint_name;
     std::string pose_parameter_name;
   };
   std::vector<AuxiliaryJoint> auxiliary_joints;
+  // Relative teleop anchors follow this observed frame (empty means the model root).
+  std::string follower_control_frame;
 };
 
 using GroupAuxiliaryPositions = std::vector<Eigen::VectorXd>;
+
+struct CartesianReference
+{
+  Eigen::Affine3d pose = Eigen::Affine3d::Identity();
+  std::string anchor_frame;
+  uint64_t sequence = 0;
+  bool valid = false;
+};
+
+using GroupCartesianReferences = std::vector<CartesianReference>;
 
 struct ControlGroupState
 {
@@ -76,6 +88,12 @@ struct TaskObjective
     Eigen::Matrix<double, 6, 1>::Zero();
   Eigen::Matrix<double, 6, 1> weight =
     Eigen::Matrix<double, 6, 1>::Ones();
+};
+
+struct EefPoseReference
+{
+  ControlGroupId group_id = kInvalidControlGroup;
+  Eigen::Affine3d pose = Eigen::Affine3d::Identity();
 };
 
 // A controller-defined linear task in joint-velocity space. This supports relative-link
@@ -94,9 +112,12 @@ struct ModeOutput
   Eigen::VectorXd damping_weight;
   Eigen::VectorXd preferred_joint_velocity;
   std::vector<bool> joint_position_limit_enabled;
+  bool self_collision_constraint_enabled = true;
+  bool self_collision_policy_set = false;
   double preferred_joint_velocity_weight = 0.0;
   std::vector<TaskObjective> task_objectives;
   std::vector<LinearTaskObjective> linear_task_objectives;
+  std::vector<EefPoseReference> eef_pose_references;
   std::unordered_map<ControlGroupId, Eigen::VectorXd> auxiliary_position_targets;
 
   void reset(const int dof, const double damping)
@@ -106,10 +127,25 @@ struct ModeOutput
     damping_weight.setConstant(dof, damping);
     preferred_joint_velocity.setZero(dof);
     joint_position_limit_enabled.assign(dof, true);
+    self_collision_constraint_enabled = true;
+    self_collision_policy_set = false;
     preferred_joint_velocity_weight = 0.0;
     task_objectives.clear();
     linear_task_objectives.clear();
+    eef_pose_references.clear();
     auxiliary_position_targets.clear();
+  }
+
+  void mergeSelfCollisionConstraint(const bool enabled)
+  {
+    if (!self_collision_policy_set) {
+      self_collision_constraint_enabled = enabled;
+      self_collision_policy_set = true;
+      return;
+    }
+    // Self-collision is a whole-robot constraint. If multiple active owners
+    // contribute to one QP, keep it enabled whenever any owner requests it.
+    self_collision_constraint_enabled = self_collision_constraint_enabled || enabled;
   }
 };
 
@@ -119,7 +155,7 @@ struct ModeContext
   const Eigen::VectorXd & follower_velocity;
   const Eigen::VectorXd & measured_follower_position;
   const Eigen::VectorXd & leader_reference;
-  const Eigen::VectorXd & leader_position;
+  const GroupCartesianReferences & cartesian_references;
   const GroupAuxiliaryPositions & measured_auxiliary_position;
   const std::vector<ControlGroupState> & group_states;
   ControlGroupMask requested_groups;
@@ -129,13 +165,30 @@ struct ModeContext
   ControlGroupMask pose_sequence_groups;
   double now_seconds;
   double dt;
+  // Action groups are enabled by an already validated fresh command. Teleop enable
+  // still waits for the next raw sample carrying a valid duration candidate.
+  bool reference_ready_on_enable = false;
 };
 
 struct ModeConfiguration
 {
   std::shared_ptr<cyclo_motion_controller::kinematics::KinematicsSolver> follower_kinematics;
-  std::shared_ptr<cyclo_motion_controller::kinematics::KinematicsSolver> leader_kinematics;
   std::vector<ControlGroupConfiguration> control_groups;
+
+  bool controlsJoint(const int index) const
+  {
+    for (const auto & group : control_groups) {
+      const auto & indices = group.follower_joint_indices;
+      if (std::find(indices.begin(), indices.end(), index) != indices.end()) {return true;}
+    }
+    return false;
+  }
+
+  Eigen::Affine3d followerControlFramePose(const ControlGroupConfiguration & group) const
+  {
+    return group.follower_control_frame.empty() ? Eigen::Affine3d::Identity() :
+           follower_kinematics->getPose(group.follower_control_frame);
+  }
 
   const ControlGroupConfiguration * findGroup(const std::string & name) const
   {

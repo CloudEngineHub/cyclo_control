@@ -19,6 +19,8 @@
 #include <string>
 #include <unordered_map>
 
+#include "cyclo_teleoperation/core/controller_constraints.hpp"
+#include "cyclo_teleoperation/core/fixed_duration_slow_start.hpp"
 #include "cyclo_teleoperation/core/teleoperation_mode.hpp"
 
 namespace cyclo_teleoperation::controllers::common
@@ -34,27 +36,13 @@ public:
   void onGroupsEnabled(
     ControlGroupMask groups, const ModeContext & context) override;
   bool update(const ModeContext & context, ModeOutput & output) override;
-  ControlGroupMask timedCommandFeedbackSyncGroups(
-    const ModeContext & context) const override;
 
 private:
   struct ArmTrajectory
   {
-    Eigen::VectorXd start;
-    Eigen::VectorXd goal;
-    double start_time = 0.0;
-    double duration = 0.0;
-    uint64_t last_sequence = 0;
-    bool active = false;
-    bool waiting_for_command = false;
-    bool slow_start_complete = false;
+    FixedDurationSlowStart slow_start;
   };
 
-  void beginSlowStart(
-    const ControlGroupConfiguration & group,
-    ArmTrajectory & trajectory,
-    uint64_t command_sequence,
-    const ModeContext & context);
   void updateArm(
     const ControlGroupConfiguration & group,
     const ControlGroupState & state,
@@ -63,9 +51,10 @@ private:
     ModeOutput & output);
 
   ModeConfiguration configuration_;
+  rclcpp::Logger logger_{rclcpp::get_logger("movej_mode")};
   std::unordered_map<ControlGroupId, ArmTrajectory> trajectories_;
+  ControllerConstraints constraints_;
   double kp_joint_ = 50.0;
   double tracking_weight_ = 10.0;
-  bool slow_start_enabled_ = true;
 };
 }  // namespace cyclo_teleoperation::controllers::common

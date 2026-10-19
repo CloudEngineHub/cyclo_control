@@ -18,13 +18,13 @@
 #include <Eigen/Geometry>
 
 #include <string>
-#include <unordered_map>
 
+#include "cyclo_teleoperation/core/controller_constraints.hpp"
 #include "cyclo_teleoperation/core/teleoperation_mode.hpp"
 
 namespace cyclo_teleoperation::controllers::common
 {
-class RelativePoseMode : public TeleoperationMode
+class AbsolutePoseMode : public TeleoperationMode
 {
 public:
   bool configure(
@@ -37,21 +37,12 @@ public:
   bool update(const ModeContext & context, ModeOutput & output) override;
 
 private:
-  struct Anchor
-  {
-    Eigen::Affine3d leader = Eigen::Affine3d::Identity();
-    Eigen::Affine3d follower = Eigen::Affine3d::Identity();
-    bool valid = false;
-  };
-
-  void captureAnchors(ControlGroupMask groups);
   Eigen::Matrix<double, 6, 1> desiredVelocity(
     const Eigen::Affine3d & current,
     const Eigen::Affine3d & goal) const;
 
   ModeConfiguration configuration_;
-  std::unordered_map<ControlGroupId, Anchor> anchors_;
-
+  ControllerConstraints constraints_;
   double kp_position_ = 50.0;
   double kp_orientation_ = 50.0;
   double weight_position_ = 10.0;

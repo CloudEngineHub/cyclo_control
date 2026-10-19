@@ -2,6 +2,11 @@
 Changelog for package cyclo_motion_controller_ros
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.5.0 (2026-10-19)
+------------------
+* Updated the AI Worker controller launch to use the relocated LG2 leader model
+* Contributors: Yeonguk Kim
+
 0.4.1 (2026-09-21)
 ------------------
 * None

@@ -23,6 +23,8 @@
 
 #include <rclcpp/rclcpp.hpp>
 
+#include "cyclo_teleoperation/core/controller_constraints.hpp"
+#include "cyclo_teleoperation/core/joint_trajectory_interpolator.hpp"
 #include "cyclo_teleoperation/core/types.hpp"
 
 namespace cyclo_teleoperation
@@ -38,6 +40,7 @@ public:
   void rebaseActiveSequences(const ModeContext & context);
 
   bool hasInitialPose(uint16_t mode) const;
+  bool automaticInitialPoseEnabled(uint16_t mode) const;
   ControlGroupMask initialPoseGroups(uint16_t mode) const;
   bool startInitialPose(uint16_t mode, const ModeContext & context);
   bool updateInitialPose(const ModeContext & context, ModeOutput & output);
@@ -92,6 +95,7 @@ private:
 
   struct Sequence
   {
+    std::string label;
     std::vector<Step> steps;
     double duration = 3.0;
     double completion_tolerance = 0.03;
@@ -105,6 +109,7 @@ private:
     const Sequence * sequence = nullptr;
     Eigen::VectorXd start;
     Eigen::VectorXd auxiliary_start;
+    JointTrajectoryInterpolator interpolator;
     size_t step_index = 0;
     double start_time = 0.0;
     Purpose purpose = Purpose::kNone;
@@ -144,10 +149,13 @@ private:
   uint8_t runnerState(ControlGroupId id, Purpose purpose) const;
 
   ModeConfiguration configuration_;
+  rclcpp::Logger logger_{rclcpp::get_logger("pose_sequence")};
   std::unordered_map<uint16_t, GroupSequence> initial_poses_;
+  std::unordered_map<uint16_t, bool> automatic_initial_pose_enabled_;
   std::unordered_map<uint16_t, GroupSequence> exit_poses_;
   std::unordered_map<uint16_t, GroupSequence> presets_;
   std::unordered_map<ControlGroupId, Runner> runners_;
+  ControllerConstraints constraints_;
   double kp_ = 30.0;
   double tracking_weight_ = 10.0;
   std::string error_message_;
