@@ -1,6 +1,7 @@
 <?xml version="1.0"?>
 <robot name="ffw_f1_follower">
-  <!--Calculation model: measured lift + 14 arm DOFs; no hardware or finger DOFs.-->
+  <!--Calculation model: measured lift + 14 arm DOFs; head collision fixed at neutral, as in BG2/SG2.-->
+  <!--No hardware or finger DOFs.-->
   <link name="base_link">
     <collision>
       <origin rpy="0 0 0" xyz="-0.15 0 0.2" />
@@ -40,140 +41,223 @@
     </collision>
   </link>
   <link name="arm_base_link">
+    <!--BG2/SG2 body proxies shifted to the F-series shoulder mount center and spacing.-->
     <collision>
-      <origin xyz="0.05398438 0.00000000 -0.05320479" rpy="0 0 0" />
+      <origin rpy="0 0.1 0" xyz="0.027 0 -0.17" />
       <geometry>
-        <box size="0.19196877 0.34579999 0.42319040" />
+        <box size="0.2 0.2164 0.63" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin rpy="0 0.1 0" xyz="0.07675 0.1082 -0.175" />
+      <geometry>
+        <cylinder length="0.63" radius="0.05" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin rpy="0 0.1 0" xyz="-0.02275 0.1082 -0.165" />
+      <geometry>
+        <box size="0.2 0.1 0.63" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin rpy="0 0.1 0" xyz="0.07675 -0.1082 -0.175" />
+      <geometry>
+        <cylinder length="0.63" radius="0.05" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin rpy="0 0.1 0" xyz="-0.02275 -0.1082 -0.165" />
+      <geometry>
+        <box size="0.2 0.1 0.63" />
+      </geometry>
+    </collision>
+  </link>
+  <!--F-series head mounting transforms; retain the BG2/SG2 head collision sphere.-->
+  <joint name="head_joint1" type="fixed">
+    <parent link="arm_base_link" />
+    <child link="head_link1" />
+    <origin rpy="0 0 0" xyz="0.102729 0 0.132803" />
+  </joint>
+  <link name="head_link1" />
+  <joint name="head_joint2" type="fixed">
+    <parent link="head_link1" />
+    <child link="head_link2" />
+    <origin rpy="0 0 0" xyz="0.0141410 0 0.0555070" />
+  </joint>
+  <link name="head_link2">
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 -0.02" />
+      <geometry>
+        <sphere radius="0.1" />
       </geometry>
     </collision>
   </link>
   <link name="arm_l_link1">
-    <collision>
-      <origin xyz="-0.00156822 0.09605000 0.00000000" rpy="0 0 0" />
-      <geometry>
-        <box size="0.13713644 0.11250000 0.09700000" />
-      </geometry>
-    </collision>
   </link>
   <link name="arm_l_link2">
+    <!--BG2/SG2 capsule: axial span 0.3000 -> 0.3200 m; keep radii and end padding.-->
     <collision>
-      <origin xyz="-0.00004341 0.00000000 -0.10720024" rpy="0 0 0" />
+      <origin rpy="0 1.5708 0" xyz="0 0 0" />
       <geometry>
-        <box size="0.13231318 0.09700000 0.31139951" />
+        <sphere radius="0.07" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 -0.16" />
+      <geometry>
+        <cylinder length="0.32" radius="0.07" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 -0.32" />
+      <geometry>
+        <sphere radius="0.07" />
       </geometry>
     </collision>
   </link>
   <link name="arm_l_link3">
-    <collision>
-      <origin xyz="0.02050818 -0.00663605 -0.09604964" rpy="0 0 0" />
-      <geometry>
-        <box size="0.12799039 0.10727209 0.12049929" />
-      </geometry>
-    </collision>
   </link>
   <link name="arm_l_link4">
+    <!--BG2/SG2 capsule: axial span 0.3415 -> 0.3200 m; keep radii and end padding.-->
     <collision>
-      <origin xyz="-0.02250293 0.00454995 -0.07875054" rpy="0 0 0" />
+      <origin rpy="0 0 0" xyz="-0.04 0 0" />
       <geometry>
-        <box size="0.13199414 0.10549990 0.24449892" />
+        <sphere radius="0.07" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin rpy="0 0 0" xyz="-0.04 0 -0.13925" />
+      <geometry>
+        <cylinder length="0.2785" radius="0.07" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin rpy="0 0 0" xyz="-0.04 0 -0.2785" />
+      <geometry>
+        <sphere radius="0.07" />
       </geometry>
     </collision>
   </link>
   <link name="arm_l_link5">
-    <collision>
-      <origin xyz="0.00000000 -0.00663468 -0.08755000" rpy="0 0 0" />
-      <geometry>
-        <box size="0.08700000 0.10726935 0.10150000" />
-      </geometry>
-    </collision>
   </link>
   <link name="arm_l_link6">
-    <collision>
-      <origin xyz="0.00000000 0.01183835 -0.03000000" rpy="0 0 0" />
-      <geometry>
-        <box size="0.10000000 0.08907671 0.14700000" />
-      </geometry>
-    </collision>
   </link>
   <link name="arm_l_link7">
+    <!--BG2/SG2 capsule: axial span 0.2150 -> 0.1860 m; keep radii and end padding.-->
     <collision>
-      <origin xyz="0.00275000 0.00000000 -0.02360772" rpy="0 0 0" />
+      <origin rpy="0 0 0" xyz="0 0 0" />
       <geometry>
-        <box size="0.11700000 0.05800000 0.09075455" />
+        <sphere radius="0.085" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 -0.0455" />
+      <geometry>
+        <cylinder length="0.091" radius="0.085" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 -0.091" />
+      <geometry>
+        <sphere radius="0.085" />
       </geometry>
     </collision>
   </link>
   <link name="arm_r_link1">
-    <collision>
-      <origin xyz="-0.00147079 -0.09605005 0.00000000" rpy="0 0 0" />
-      <geometry>
-        <box size="0.13694157 0.11250011 0.09700000" />
-      </geometry>
-    </collision>
   </link>
   <link name="arm_r_link2">
+    <!--BG2/SG2 capsule: axial span 0.3000 -> 0.3200 m; keep radii and end padding.-->
     <collision>
-      <origin xyz="-0.00004341 0.00000000 -0.10720024" rpy="0 0 0" />
+      <origin rpy="0 1.5708 0" xyz="0 0 0" />
       <geometry>
-        <box size="0.13231318 0.09700000 0.31139951" />
+        <sphere radius="0.07" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 -0.16" />
+      <geometry>
+        <cylinder length="0.32" radius="0.07" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 -0.32" />
+      <geometry>
+        <sphere radius="0.07" />
       </geometry>
     </collision>
   </link>
   <link name="arm_r_link3">
-    <collision>
-      <origin xyz="0.02050818 0.00663605 -0.09654964" rpy="0 0 0" />
-      <geometry>
-        <box size="0.12799039 0.10727209 0.11949929" />
-      </geometry>
-    </collision>
   </link>
   <link name="arm_r_link4">
+    <!--BG2/SG2 capsule: axial span 0.3415 -> 0.3200 m; keep radii and end padding.-->
     <collision>
-      <origin xyz="-0.02250293 -0.00454995 -0.07875054" rpy="0 0 0" />
+      <origin rpy="0 0 0" xyz="-0.04 0 0" />
       <geometry>
-        <box size="0.13199414 0.10549990 0.24449892" />
+        <sphere radius="0.07" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin rpy="0 0 0" xyz="-0.04 0 -0.13925" />
+      <geometry>
+        <cylinder length="0.2785" radius="0.07" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin rpy="0 0 0" xyz="-0.04 0 -0.2785" />
+      <geometry>
+        <sphere radius="0.07" />
       </geometry>
     </collision>
   </link>
   <link name="arm_r_link5">
-    <collision>
-      <origin xyz="0.00000000 0.00663468 -0.08755000" rpy="0 0 0" />
-      <geometry>
-        <box size="0.08700000 0.10726935 0.10150000" />
-      </geometry>
-    </collision>
   </link>
   <link name="arm_r_link6">
-    <collision>
-      <origin xyz="0.00000000 -0.01183835 -0.03000000" rpy="0 0 0" />
-      <geometry>
-        <box size="0.10000000 0.08907671 0.14700000" />
-      </geometry>
-    </collision>
   </link>
   <link name="arm_r_link7">
+    <!--BG2/SG2 capsule: axial span 0.2150 -> 0.1860 m; keep radii and end padding.-->
     <collision>
-      <origin xyz="0.00275000 0.00000000 -0.02360772" rpy="0 0 0" />
+      <origin rpy="0 0 0" xyz="0 0 0" />
       <geometry>
-        <box size="0.11700000 0.05800000 0.09075455" />
+        <sphere radius="0.085" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 -0.0455" />
+      <geometry>
+        <cylinder length="0.091" radius="0.085" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 -0.091" />
+      <geometry>
+        <sphere radius="0.085" />
       </geometry>
     </collision>
   </link>
   <link name="end_effector_l_link">
-    <collision>
-      <origin xyz="0.00145000 0.00000000 0.06453261" rpy="0 0 0" />
+    <!--TCP marker only; gripper collision is represented on arm_l_link7.-->
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <box size="0.06640000 0.16631853 0.15493479" />
+        <box size="0.01 0.01 0.01" />
       </geometry>
-    </collision>
+      <material name="red">
+        <color rgba="1.0 0.0 0.0 1" />
+      </material>
+    </visual>
   </link>
   <link name="end_effector_r_link">
-    <collision>
-      <origin xyz="0.00145000 0.00000000 0.06453261" rpy="0 0 0" />
+    <!--TCP marker only; gripper collision is represented on arm_r_link7.-->
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <box size="0.06640000 0.16631853 0.15493479" />
+        <box size="0.01 0.01 0.01" />
       </geometry>
-    </collision>
+      <material name="red">
+        <color rgba="1.0 0.0 0.0 1" />
+      </material>
+    </visual>
   </link>
   <joint name="lift_joint" type="prismatic">
     <parent link="base_link" />
