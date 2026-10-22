@@ -35,10 +35,6 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     """Create the launch description for AI worker controllers."""
     model = LaunchConfiguration('model')
-    # BG2 uses the SG2 collision policy, as specified by its packaged URDF.
-    srdf_model = PythonExpression([
-        "'sg2' if '", model, "' == 'bg2' else '", model, "'",
-    ])
     declared_arguments = [
         DeclareLaunchArgument(
             'model',
@@ -130,7 +126,7 @@ def generate_launch_description():
                     FindPackageShare('cyclo_motion_controller_models'),
                     'models',
                     'ai_worker',
-                    ['ffw_', srdf_model, '_follower_default.srdf'],
+                    ['ffw_', model, '_follower_default.srdf'],
                 ]
             ),
             description='Path to robot SRDF file.',
@@ -142,7 +138,7 @@ def generate_launch_description():
                     FindPackageShare('cyclo_motion_controller_models'),
                     'models',
                     'ai_worker',
-                    ['ffw_', srdf_model, '_follower_modified.srdf'],
+                    ['ffw_', model, '_follower_modified.srdf'],
                 ]
             ),
             description='Path to robot SRDF file with hand collision disabled.',
