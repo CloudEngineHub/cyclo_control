@@ -2,7 +2,7 @@
 Changelog for package cyclo_motion_controller_ros
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-0.5.1 (2026-10-21)
+0.5.1 (2026-10-26)
 ------------------
 * Added follower model selection for SG2, BG2, F1, and F2 with model-specific URDF/SRDF paths
 * Passed the selected follower URDF to VR arm retargeting and declared launch runtime dependencies
